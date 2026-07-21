@@ -1,7 +1,7 @@
 {
   "ZmptKeeperCheck": {
     "name": "ZMPT Keeper Check",
-    "description": "Periodically fetch ZMPT seed-group official-seed volume, judge pass/fail (5T/10T); 10T group salary = 200000+(floor(T)-5)*50000; push plain-text result to notification channel.",
+    "description": "Periodically fetch ZMPT seed-group official-seed volume and judge pass/fail against the group threshold; push plain-text result to notification channel.",
     "labels": "seed",
     "version": "1.0.0",
     "icon": "Moviepilot_A.png",

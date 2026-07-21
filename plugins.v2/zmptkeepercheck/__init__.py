@@ -15,11 +15,11 @@ from app.utils.http import RequestUtils
 
 
 class ZmptKeeperCheck(_PluginBase):
-    """ZMPT 保种组检查：定时抓取组员官种体积，判定合格/不合格，10T组按公式算工资，结果推送通知。"""
+    """ZMPT 保种组检查：定时抓取组员官种体积，判定合格/不合格，结果推送通知。"""
 
     # ===== 插件元信息（必须与 package.v2.json 完全一致）=====
     plugin_name = "ZMPT保种组检查"
-    plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；10T组按 200000+(取整T-5)*50000 算工资；结果推送到通知渠道。"
+    plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
     plugin_version = "1.0.0"
     plugin_author = "2536003090"
@@ -37,7 +37,6 @@ class ZmptKeeperCheck(_PluginBase):
     _delay = 1.0
     _groups = []
     _last_result = ""
-    _payroll = {"base": 200000, "per_tb": 50000, "base_tb": 5, "min_tb": 10}
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -54,11 +53,11 @@ class ZmptKeeperCheck(_PluginBase):
 
     @staticmethod
     def _parse_groups_config(raw):
-        """raw: id:名称:阈值T:是否算工资(1/0)，多组用分号分隔。空则用默认两组。"""
+        """raw: id:名称:阈值T，多组用分号分隔。空则用默认两组。"""
         if not raw:
             return [
-                {"id": "6", "name": "5T组", "threshold": 5.0, "payroll": False},
-                {"id": "10", "name": "10T组", "threshold": 10.0, "payroll": True},
+                {"id": "6", "name": "5T组", "threshold": 5.0},
+                {"id": "10", "name": "10T组", "threshold": 10.0},
             ]
         result = []
         for part in str(raw).split(";"):
@@ -73,7 +72,6 @@ class ZmptKeeperCheck(_PluginBase):
                     "id": seg[0].strip(),
                     "name": seg[1].strip(),
                     "threshold": float(seg[2]),
-                    "payroll": len(seg) > 3 and seg[3].strip() in ("1", "true", "yes"),
                 })
             except Exception:
                 continue
@@ -154,14 +152,14 @@ class ZmptKeeperCheck(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VTextField", "props": {"model": "groups",
-                            "label": "组配置（id:名称:阈值T:是否算工资1/0，分号分隔）",
-                            "placeholder": "6:5T组:5:0;10:10T组:10:1"}},
+                            "label": "组配置（id:名称:阈值T，分号分隔）",
+                            "placeholder": "6:5T组:5;10:10T组:10"}},
                     ]},
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                            "text": "工资公式：200000 + (取整T − 5) × 50000，取整T ≥ 10 才发。保存后可在 MoviePilot 聊天框发送 /zmpt_check 立即执行一次。"}},
+                            "text": "保存后可在 MoviePilot 聊天框发送 /zmpt_check 立即执行一次。"}},
                     ]},
                 ]},
             ]},
@@ -171,7 +169,7 @@ class ZmptKeeperCheck(_PluginBase):
             "cookie": "",
             "cron": "0 8 * * *",
             "delay": 1.0,
-            "groups": "6:5T组:5:0;10:10T组:10:1",
+            "groups": "6:5T组:5;10:10T组:10",
         }
 
     def get_page(self) -> List[dict]:
@@ -217,12 +215,11 @@ class ZmptKeeperCheck(_PluginBase):
             return msg
         rows = []
         ok_n = bad_n = err_n = 0
-        total_pay = 0
         for u in users:
             vol = self._fetch_volume(u["id"])
             if vol is None:
                 err_n += 1
-                status, volstr, intt, salary = "异常", "未知", "-", None
+                status, volstr, intt = "异常", "未知", "-"
             else:
                 intt = int(vol)
                 volstr = f"{vol:.3f} TB"
@@ -232,32 +229,24 @@ class ZmptKeeperCheck(_PluginBase):
                 else:
                     bad_n += 1
                     status = "不合格"
-                salary = self._calc_salary(vol) if g.get("payroll") else None
-                if salary:
-                    total_pay += salary
             rows.append({"id": u["id"], "name": u["name"], "level": u["level"],
-                         "vol": volstr, "intt": intt, "salary": salary, "status": status})
+                         "vol": volstr, "intt": intt, "status": status})
             time.sleep(self._delay)
-        text = self._format_text(g, rows, ok_n, bad_n, err_n, total_pay)
+        text = self._format_text(g, rows, ok_n, bad_n, err_n)
         self._notify_msg(f"ZMPT {g['name']} 审查结果", text)
         summary = f"【{g['name']}】共 {len(rows)} 人 · 合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}"
-        if g.get("payroll"):
-            summary += f" · 发工资合计 {total_pay:,}"
         return summary
 
-    def _format_text(self, g, rows, ok_n, bad_n, err_n, total_pay):
+    def _format_text(self, g, rows, ok_n, bad_n, err_n):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         lines = [
             f"抓取时间：{now}",
             f"{g['name']} · 阈值 ≥ {g['threshold']:.0f} TB 合格 · 共 {len(rows)} 人（合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}）",
         ]
-        if g.get("payroll"):
-            lines.append(f"发工资合计：{total_pay:,}（公式 200000+(取整T-5)×50000，取整T≥10 才发）")
         lines.append("")
-        lines.append("ID\t用户名\t等级\t官种体积\t取整T\t工资\t结果")
+        lines.append("ID\t用户名\t等级\t官种体积\t取整T\t结果")
         for r in rows:
-            pay = f"{r['salary']:,}" if r["salary"] else "-"
-            lines.append(f"{r['id']}\t{r['name']}\t{r['level'] or '-'}\t{r['vol']}\t{r['intt']}\t{pay}\t{r['status']}")
+            lines.append(f"{r['id']}\t{r['name']}\t{r['level'] or '-'}\t{r['vol']}\t{r['intt']}\t{r['status']}")
         return "\n".join(lines)
 
     # ====================== HTTP ======================
@@ -390,14 +379,6 @@ class ZmptKeeperCheck(_PluginBase):
         unit = (m.group(2) or "TB").upper().replace("IB", "B")
         factor = {"PB": 1024, "TB": 1, "GB": 1 / 1024, "MB": 1 / 1024 ** 2, "KB": 1 / 1024 ** 3, "B": 1 / 1024 ** 4}
         return num * factor.get(unit, 1)
-
-    def _calc_salary(self, vol):
-        if vol is None:
-            return None
-        x = int(vol)
-        if x < self._payroll["min_tb"]:
-            return None
-        return self._payroll["base"] + (x - self._payroll["base_tb"]) * self._payroll["per_tb"]
 
     # ====================== 通知 ======================
     def _notify_msg(self, title, text):
