@@ -1,12 +1,15 @@
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from bs4 import BeautifulSoup
 
+from app.core.config import settings
 from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
@@ -21,15 +24,22 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
     plugin_order = 28
     auth_level = 1
 
+    # ===== 固定组配置（不在UI显示）=====
+    _DEFAULT_GROUPS = [
+        {"id": "6", "name": "5T组", "threshold": 5.0},
+        {"id": "10", "name": "10T组", "threshold": 10.0},
+    ]
+
     # ===== 运行时状态 =====
     _enabled = False
+    _onlyonce = False
     _cookie = ""
     _base = "https://zmpt.cc"
     _cron = "0 8 * * *"
@@ -38,10 +48,13 @@ class ZmptKeeperCheck(_PluginBase):
     _groups = []
     _last_result = ""
     _member_url = ""  # 组员列表URL模板，支持 {id} 和 {page} 占位符；空则用内置默认
+    _scheduler = None  # “立即运行一次”用的一次性调度器
 
     def init_plugin(self, config: dict = None):
+        self.stop_service()
         config = config or {}
         self._enabled = bool(config.get("enabled"))
+        self._onlyonce = bool(config.get("onlyonce"))
         self._cookie = (config.get("cookie") or "").strip()
         self._cron = (config.get("cron") or "0 8 * * *").strip()
         self._notify = config.get("notify") is not False
@@ -49,35 +62,41 @@ class ZmptKeeperCheck(_PluginBase):
             self._delay = float(config.get("delay") or 1.0)
         except Exception:
             self._delay = 1.0
-        self._groups = self._parse_groups_config(config.get("groups"))
+        self._groups = [dict(g) for g in self._DEFAULT_GROUPS]
         self._member_url = (config.get("member_url") or "").strip()
-        logger.info(f"ZMPT保种组检查 已加载：enabled={self._enabled} cron={self._cron} groups={self._groups} member_url={self._member_url or '(默认)'}")
+        logger.info(f"ZMPT保种组检查 已加载：enabled={self._enabled} cron={self._cron} onlyonce={self._onlyonce} member_url={self._member_url or '(默认)'}")
 
-    @staticmethod
-    def _parse_groups_config(raw):
-        """raw: id:名称:阈值T，多组用分号分隔。空则用默认两组。"""
-        if not raw:
-            return [
-                {"id": "6", "name": "5T组", "threshold": 5.0},
-                {"id": "10", "name": "10T组", "threshold": 10.0},
-            ]
-        result = []
-        for part in str(raw).split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            seg = part.split(":")
-            if len(seg) < 3:
-                continue
+        # 立即运行一次：开关打开并保存后，3秒后触发一次检查，随后自动关闭开关
+        if self._enabled and self._onlyonce:
+            self._onlyonce = False
             try:
-                result.append({
-                    "id": seg[0].strip(),
-                    "name": seg[1].strip(),
-                    "threshold": float(seg[2]),
-                })
-            except Exception:
-                continue
-        return result
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                self._scheduler.add_job(
+                    func=self.check,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    id="ZmptKeeperCheck.RunOnce",
+                    name="ZMPT保种组检查立即运行",
+                )
+                self.update_config(self._build_config())
+                self._scheduler.print_jobs()
+                self._scheduler.start()
+                logger.info("ZMPT保种组检查：已计划立即运行一次")
+            except Exception as e:
+                logger.error(f"ZMPT保种组检查：立即运行调度失败: {e}")
+                self.update_config(self._build_config())
+
+    def _build_config(self) -> dict:
+        """构造当前配置字典，用于 update_config 回写（如把 onlyonce 开关关掉）。"""
+        return {
+            "enabled": self._enabled,
+            "onlyonce": self._onlyonce,
+            "cookie": self._cookie,
+            "cron": self._cron,
+            "notify": self._notify,
+            "delay": self._delay,
+            "member_url": self._member_url,
+        }
 
     def get_state(self) -> bool:
         return self._enabled
@@ -121,19 +140,27 @@ class ZmptKeeperCheck(_PluginBase):
         self.check()
 
     def stop_service(self):
-        # 无额外后台线程；定时任务由框架统一管理
-        pass
+        # 关闭“立即运行一次”的一次性调度器（cron 定时任务由框架统一管理）
+        try:
+            if self._scheduler and self._scheduler.running:
+                self._scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.warn(f"ZMPT保种组检查：停止调度器失败: {e}")
+        self._scheduler = None
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """配置页：返回 (页面JSON, 默认配置)。model 必须放在 props 内。"""
         return [
             {"component": "VForm", "content": [
                 {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                         {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}},
                     ]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                         {"component": "VSwitch", "props": {"model": "notify", "label": "推送通知"}},
+                    ]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}},
                     ]},
                 ]},
                 {"component": "VRow", "content": [
@@ -153,13 +180,6 @@ class ZmptKeeperCheck(_PluginBase):
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
-                        {"component": "VTextField", "props": {"model": "groups",
-                            "label": "组配置（id:名称:阈值T，分号分隔）",
-                            "placeholder": "6:5T组:5;10:10T组:10"}},
-                    ]},
-                ]},
-                {"component": "VRow", "content": [
-                    {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VTextField", "props": {"model": "member_url",
                             "label": "组员列表URL模板（可选，含 {id} 和 {page}）",
                             "placeholder": "留空用默认；自定义形如 https://zmpt.cc/xxx.php?id={id}&page={page}"}},
@@ -168,17 +188,17 @@ class ZmptKeeperCheck(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                            "text": "若提示\"未抓到组员\"：用浏览器打开保种组组员列表页，把地址栏网址粘到上面的\"组员列表URL模板\"（数字换成 {id}，加 &page={page}）。保存后发送 /zmpt_check 立即执行一次。"}},
+                            "text": "打开\"立即运行一次\"开关并保存，3秒后执行一次检查（执行完会自动关闭）。组配置已内置（5T组id=6 / 10T组id=10），无需填写。"}},
                     ]},
                 ]},
             ]},
         ], {
             "enabled": False,
+            "onlyonce": False,
             "notify": True,
             "cookie": "",
             "cron": "0 8 * * *",
             "delay": 1.0,
-            "groups": "6:5T组:5;10:10T组:10",
             "member_url": "",
         }
 
