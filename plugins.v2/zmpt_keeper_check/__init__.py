@@ -2,9 +2,12 @@ import re
 import time
 import traceback
 from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
+from apscheduler.triggers.cron import CronTrigger
 from bs4 import BeautifulSoup
 
+from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
@@ -14,29 +17,30 @@ from app.utils.http import RequestUtils
 class ZmptKeeperCheck(_PluginBase):
     """ZMPT 保种组检查：定时抓取组员官种体积，判定合格/不合格，10T组按公式算工资，结果推送通知。"""
 
-    # 插件元信息
+    # ===== 插件元信息（必须与 package.v2.json 完全一致）=====
     plugin_name = "ZMPT保种组检查"
-    plugin_desc = "定时抓取 ZMPT 保种组官种体积，判定合格/不合格；10T组按 200000+(取整T-5)*50000 算工资；结果以纯文本推送到通知渠道。"
-    plugin_version = "1.0"
-    plugin_author = "you"
-    plugin_icon = ""
+    plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；10T组按 200000+(取整T-5)*50000 算工资；结果推送到通知渠道。"
+    plugin_icon = "Moviepilot_A.png"
+    plugin_version = "1.0.0"
+    plugin_author = "2536003090"
+    author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
     plugin_order = 28
     auth_level = 1
 
-    # 默认配置
+    # ===== 运行时状态 =====
     _enabled = False
     _cookie = ""
     _base = "https://zmpt.cc"
-    _cron = "0 8 * * *"          # 每天 8 点（cron5：分 时 日 月 周）
+    _cron = "0 8 * * *"
     _notify = True
-    _delay = 1.0                 # 每次请求间隔(秒)，降低服务器压力
-    _groups = []                 # [{id,name,threshold,payroll}]
+    _delay = 1.0
+    _groups = []
+    _last_result = ""
     _payroll = {"base": 200000, "per_tb": 50000, "base_tb": 5, "min_tb": 10}
 
     def init_plugin(self, config: dict = None):
-        if not config:
-            return
+        config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._cookie = (config.get("cookie") or "").strip()
         self._cron = (config.get("cron") or "0 8 * * *").strip()
@@ -50,7 +54,7 @@ class ZmptKeeperCheck(_PluginBase):
 
     @staticmethod
     def _parse_groups_config(raw):
-        """raw 格式: id:名称:阈值T:是否算工资(1/0)，多组用分号分隔。空则用默认两组。"""
+        """raw: id:名称:阈值T:是否算工资(1/0)，多组用分号分隔。空则用默认两组。"""
         if not raw:
             return [
                 {"id": "6", "name": "5T组", "threshold": 5.0, "payroll": False},
@@ -79,61 +83,108 @@ class ZmptKeeperCheck(_PluginBase):
         return self._enabled
 
     @staticmethod
-    def get_command() -> list:
-        return []
-
-    def get_service(self) -> list:
-        """定时任务：交给 MoviePilot 调度器，按 cron5 表达式触发"""
-        if not self._enabled or not self._cron:
-            return []
+    def get_command() -> List[Dict[str, Any]]:
+        # 注册 /zmpt_check 命令，方便手动触发，不用等 cron
         return [{
-            "id": "ZmptKeeperCheck",
-            "name": "ZMPT保种组检查",
-            "trigger": "cron",
-            "func": self.check,
-            "kwargs": {"cron": self._cron},
+            "cmd": "/zmpt_check",
+            "event": EventType.PluginAction,
+            "desc": "立即执行ZMPT保种组检查",
+            "category": "插件命令",
+            "data": {"action": "zmpt_keeper_check_run"},
         }]
 
+    def get_api(self) -> List[Dict[str, Any]]:
+        return []
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """定时任务：用 CronTrigger.from_crontab 解析 cron5 表达式"""
+        if not self.get_state() or not self._cron:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cron)
+        except Exception as e:
+            logger.error(f"ZMPT cron 表达式非法: {self._cron} -> {e}")
+            return []
+        return [{
+            "id": "ZmptKeeperCheck.Check",
+            "name": "ZMPT保种组检查",
+            "trigger": trigger,
+            "func": self.check,
+            "kwargs": {},
+        }]
+
+    @eventmanager.register(EventType.PluginAction)
+    def _on_action(self, event: Event):
+        if (event.event_data or {}).get("action") != "zmpt_keeper_check_run":
+            return
+        logger.info("ZMPT保种组检查：收到手动触发命令 /zmpt_check")
+        self.check()
+
     def stop_service(self):
-        # 定时任务由框架统一管理，无需手动释放
+        # 无额外后台线程；定时任务由框架统一管理
         pass
 
-    def get_form(self):
-        """前端配置表单（VNode）。注意：model/key 放顶层；不同 MP 版本若不显示，把它移到 props 内即可。"""
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """配置页：返回 (页面JSON, 默认配置)。model 必须放在 props 内。"""
         return [
             {"component": "VForm", "content": [
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                        {"component": "VSwitch", "props": {"label": "启用插件"}, "model": "enabled", "key": "enabled"},
+                        {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}},
                     ]},
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                        {"component": "VSwitch", "props": {"label": "推送通知"}, "model": "notify", "key": "notify"},
+                        {"component": "VSwitch", "props": {"model": "notify", "label": "推送通知"}},
                     ]},
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
-                        {"component": "VTextarea", "props": {"label": "ZMPT Cookie", "rows": 3,
-                                                              "placeholder": "从浏览器复制 zmpt.cc 的 Cookie（至少含 session）"}, "model": "cookie", "key": "cookie"},
+                        {"component": "VTextarea", "props": {"model": "cookie", "label": "ZMPT Cookie", "rows": 3,
+                            "placeholder": "浏览器登录 zmpt.cc 后，F12 复制整串 Cookie（至少含 session）"}},
                     ]},
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                        {"component": "VTextField", "props": {"label": "定时 cron（5字段：分 时 日 月 周）",
-                                                              "placeholder": "0 8 * * *（每天8点）"}, "model": "cron", "key": "cron"},
+                        {"component": "VTextField", "props": {"model": "cron",
+                            "label": "定时 cron（5字段：分 时 日 月 周）", "placeholder": "0 8 * * *（每天8点）"}},
                     ]},
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                        {"component": "VTextField", "props": {"label": "请求间隔(秒)", "placeholder": "1.0"},
-                                                              "model": "delay", "key": "delay"},
+                        {"component": "VTextField", "props": {"model": "delay", "label": "请求间隔(秒)", "placeholder": "1.0"}},
                     ]},
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
-                        {"component": "VTextField", "props": {"label": "组配置（id:名称:阈值T:是否算工资1/0，分号分隔）",
-                                                              "placeholder": "6:5T组:5:0;10:10T组:10:1"}, "model": "groups", "key": "groups"},
+                        {"component": "VTextField", "props": {"model": "groups",
+                            "label": "组配置（id:名称:阈值T:是否算工资1/0，分号分隔）",
+                            "placeholder": "6:5T组:5:0;10:10T组:10:1"}},
                     ]},
                 ]},
-                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text":
-                    "工资公式：200000 + (取整T − 5) × 50000，取整T ≥ 10 才发。结果以纯文本推送到通知渠道（微信/TG等），你复制粘贴到金山文档。"}},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                            "text": "工资公式：200000 + (取整T − 5) × 50000，取整T ≥ 10 才发。保存后可在 MoviePilot 聊天框发送 /zmpt_check 立即执行一次。"}},
+                    ]},
+                ]},
+            ]},
+        ], {
+            "enabled": False,
+            "notify": True,
+            "cookie": "",
+            "cron": "0 8 * * *",
+            "delay": 1.0,
+            "groups": "6:5T组:5:0;10:10T组:10:1",
+        }
+
+    def get_page(self) -> List[dict]:
+        if not self._last_result:
+            return [
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                    "text": "尚未运行。配置好 Cookie 后，发送 /zmpt_check 立即执行，或等待定时触发。"}},
+            ]
+        return [
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": self._last_result}},
+                ]},
             ]},
         ]
 
@@ -142,23 +193,28 @@ class ZmptKeeperCheck(_PluginBase):
         if not self._enabled:
             return
         if not self._cookie:
-            logger.warn("ZMPT保种组检查：未配置 Cookie，跳过")
+            logger.warn("ZMPT保种组检查：未配置 Cookie")
+            self._last_result = "⚠️ 未配置 Cookie，无法抓取。"
             self._notify_msg("ZMPT保种组检查", "⚠️ 未配置 Cookie，无法抓取。请在插件设置填入 zmpt.cc 的 Cookie。")
             return
         logger.info("ZMPT保种组检查：开始执行")
+        summary = []
         for g in self._groups:
             try:
-                self._check_group(g)
+                summary.append(self._check_group(g))
             except Exception as e:
                 logger.error(f"ZMPT保种组检查 组{g.get('id')} 出错: {e}")
                 logger.error(traceback.format_exc())
+                summary.append(f"{g.get('name', '组' + str(g.get('id')))}：执行出错 {e}")
+        self._last_result = "\n\n".join(summary) if summary else "无组配置"
         logger.info("ZMPT保种组检查：执行完成")
 
     def _check_group(self, g):
         users = self._fetch_users(g["id"])
         if not users:
-            self._notify_msg(f"ZMPT {g['name']}", f"⚠️ 未抓到组员（组id={g['id']}），请检查 Cookie 或页面分页结构。")
-            return
+            msg = f"⚠️ {g['name']}：未抓到组员（组id={g['id']}），请检查 Cookie 或分页结构。"
+            self._notify_msg(f"ZMPT {g['name']}", msg)
+            return msg
         rows = []
         ok_n = bad_n = err_n = 0
         total_pay = 0
@@ -168,7 +224,7 @@ class ZmptKeeperCheck(_PluginBase):
                 err_n += 1
                 status, volstr, intt, salary = "异常", "未知", "-", None
             else:
-                intt = int(vol)  # 向下取整
+                intt = int(vol)
                 volstr = f"{vol:.3f} TB"
                 if vol >= g["threshold"]:
                     ok_n += 1
@@ -184,6 +240,10 @@ class ZmptKeeperCheck(_PluginBase):
             time.sleep(self._delay)
         text = self._format_text(g, rows, ok_n, bad_n, err_n, total_pay)
         self._notify_msg(f"ZMPT {g['name']} 审查结果", text)
+        summary = f"【{g['name']}】共 {len(rows)} 人 · 合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}"
+        if g.get("payroll"):
+            summary += f" · 发工资合计 {total_pay:,}"
+        return summary
 
     def _format_text(self, g, rows, ok_n, bad_n, err_n, total_pay):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -224,15 +284,12 @@ class ZmptKeeperCheck(_PluginBase):
             logger.warn(f"ZMPT请求失败 {url}: {e}")
         return None
 
-    # ====================== 抓组员（复用油猴已验证逻辑）======================
+    # ====================== 抓组员 ======================
     def _fetch_users(self, role_id):
-        users = []
-        seen = set()
+        users, seen = [], set()
         page = 1
         while page <= 50:
-            # 尝试 URL 分页（Filament 通常同步 ?page= 到 URL）
-            url = f"{self._base}/nexusphp/roles/{role_id}/edit?page={page}"
-            html = self._http_get(url)
+            html = self._http_get(f"{self._base}/nexusphp/roles/{role_id}/edit?page={page}")
             if not html:
                 break
             page_users = self._parse_users(html)
@@ -251,7 +308,7 @@ class ZmptKeeperCheck(_PluginBase):
         return users
 
     def _parse_users(self, html):
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         users = []
         for a in soup.select('a[href*="userdetails"]'):
             href = a.get("href", "")
@@ -281,20 +338,15 @@ class ZmptKeeperCheck(_PluginBase):
         if lvl_col < 0:
             return ""
         cells = tr.find_all("td")
-        if lvl_col < len(cells):
-            return cells[lvl_col].get_text(strip=True)
-        return ""
+        return cells[lvl_col].get_text(strip=True) if lvl_col < len(cells) else ""
 
-    # ====================== 抓官种体积（复用油猴已验证逻辑）======================
+    # ====================== 抓官种体积 ======================
     def _fetch_volume(self, uid):
         html = self._http_get(f"{self._base}/userdetails.php?id={uid}")
-        if not html:
-            return None
-        return self._extract_volume(html)
+        return self._extract_volume(html) if html else None
 
     def _extract_volume(self, html):
-        soup = BeautifulSoup(html, "lxml")
-        # 找含"官种加成"的最小容器（优先 tr）
+        soup = BeautifulSoup(html, "html.parser")
         scope, scope_len = None, None
         for el in soup.select("tr, table, tbody, dl, div, section, fieldset"):
             try:
@@ -305,7 +357,6 @@ class ZmptKeeperCheck(_PluginBase):
                 s = len(str(el))
                 if scope is None or s < scope_len:
                     scope, scope_len = el, s
-        # 策略A：容器内"整个单元格=数字+单位"
         if scope:
             for c in scope.select("td, th, dd, li, span, div"):
                 t = c.get_text(strip=True)
@@ -313,7 +364,6 @@ class ZmptKeeperCheck(_PluginBase):
                     v = self._parse_size_tb(t)
                     if v is not None:
                         return v
-        # 策略0：正则兜底
         text = soup.get_text(" ", strip=True)
         idx = text.find("官种加成")
         if idx < 0:
@@ -344,7 +394,7 @@ class ZmptKeeperCheck(_PluginBase):
     def _calc_salary(self, vol):
         if vol is None:
             return None
-        x = int(vol)  # 向下取整
+        x = int(vol)
         if x < self._payroll["min_tb"]:
             return None
         return self._payroll["base"] + (x - self._payroll["base_tb"]) * self._payroll["per_tb"]
@@ -354,13 +404,16 @@ class ZmptKeeperCheck(_PluginBase):
         logger.info(f"[{title}] 通知内容:\n{text}")
         if not self._notify:
             return
+        sent = False
         try:
-            self.eventmanager.send_event(EventType.Notification, {
-                "channel": None,
-                "title": title,
-                "text": text,
-                "image": "",
-                "userid": None,
-            })
+            self.post_message(title=title, text=text)
+            sent = True
         except Exception as e:
-            logger.error(f"通知发送失败: {e}\n{text[:500]}")
+            logger.warn(f"ZMPT post_message 失败，回退 eventmanager: {e}")
+        if not sent:
+            try:
+                self.eventmanager.send_event(EventType.Notification, {
+                    "channel": None, "title": title, "text": text, "image": "", "userid": None,
+                })
+            except Exception as e:
+                logger.error(f"ZMPT 通知发送失败: {e}")
