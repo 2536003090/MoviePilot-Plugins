@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -252,7 +252,7 @@ class ZmptKeeperCheck(_PluginBase):
     def _check_group(self, g):
         users, diag = self._fetch_users(g["id"])
         if not users:
-            msg = f"⚠️ {g['name']}：未抓到组员（组id={g['id']}）。\n诊断：{diag}"
+            msg = f"[插件v{self.plugin_version}{'/浏览器' if self._use_browser else '/普通'}] ⚠️ {g['name']}：未抓到组员（组id={g['id']}）。\n诊断：{diag}"
             self._notify_msg(f"ZMPT {g['name']}", msg)
             return msg
         rows = []
@@ -276,12 +276,13 @@ class ZmptKeeperCheck(_PluginBase):
             time.sleep(self._delay)
         text = self._format_text(g, rows, ok_n, bad_n, err_n)
         self._notify_msg(f"ZMPT {g['name']} 审查结果", text)
-        summary = f"【{g['name']}】共 {len(rows)} 人 · 合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}"
+        summary = f"[v{self.plugin_version}{'/浏览器' if self._use_browser else '/普通'}] 【{g['name']}】共 {len(rows)} 人 · 合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}"
         return summary
 
     def _format_text(self, g, rows, ok_n, bad_n, err_n):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         lines = [
+            f"插件版本：v{self.plugin_version}（{'浏览器模式' if self._use_browser else '普通模式'}）",
             f"抓取时间：{now}",
             f"{g['name']} · 阈值 ≥ {g['threshold']:.0f} TB 合格 · 共 {len(rows)} 人（合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}）",
         ]
