@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -440,7 +440,49 @@ class ZmptKeeperCheck(_PluginBase):
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
-            # 2) 设每页100 + 触发 loadTable（用 wire:id + Livewire.find 精准调用，比 .all() 稳）
+            # 2) 轮询触发表格加载：反复 loadTable + scrollIntoView，直到出现组员链接或超时(~30s)
+            for _ in range(15):
+                try:
+                    page.evaluate("""() => {
+                        try {
+                            const L = window.Livewire;
+                            if (L && L.find) {
+                                const els = document.getElementsByTagName('*');
+                                for (const el of els) {
+                                    const id = el.getAttribute && el.getAttribute('wire:id');
+                                    if (id) {
+                                        try { el.scrollIntoView({block: 'center'}); } catch(e){}
+                                        const comp = L.find(id);
+                                        if (comp) ['loadTable','loadRecords'].forEach(m => { try { comp.call(m); } catch(e){} });
+                                    }
+                                }
+                            }
+                        } catch(e){}
+                    }""")
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    pass
+                try:
+                    n = page.evaluate("""() => {
+                        let n = 0;
+                        document.querySelectorAll('a[href]').forEach(a => {
+                            const h = a.href || '';
+                            if (/(user|profile|member|userdetails|uid|userid)/i.test(h) && /[0-9]{3,}/.test(h)) n++;
+                        });
+                        return n;
+                    }""")
+                except Exception:
+                    n = 0
+                if n and n > 0:
+                    break
+                try:
+                    page.evaluate("() => new Promise(r => setTimeout(r, 1500))")
+                except Exception:
+                    pass
+            # 3) 表格加载后再设每页 100（避免干扰加载触发）
             try:
                 page.evaluate("""() => {
                     try {
@@ -449,30 +491,11 @@ class ZmptKeeperCheck(_PluginBase):
                             const els = document.getElementsByTagName('*');
                             for (const el of els) {
                                 const id = el.getAttribute && el.getAttribute('wire:id');
-                                if (id) {
-                                    const comp = L.find(id);
-                                    if (comp) {
-                                        try { comp.set('tableRecordsPerPage', 100); } catch(e){}
-                                        ['loadTable','loadRecords'].forEach(m => { try { comp.call(m); } catch(e){} });
-                                    }
-                                }
+                                if (id) { try { L.find(id).set('tableRecordsPerPage', 100); } catch(e){} }
                             }
                         }
                     } catch(e){}
                 }""")
-                page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-            # 3) 增量缓慢滚动整页（v1.1.0 验证过：能稳定触发 Filament 的 IntersectionObserver 懒加载）
-            try:
-                page.evaluate("""() => new Promise(async (resolve) => {
-                    const total = document.body.scrollHeight;
-                    for (let y = 0; y <= total + 800; y += 350) {
-                        window.scrollTo(0, y);
-                        await new Promise(r => setTimeout(r, 350));
-                    }
-                    resolve();
-                })""")
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
