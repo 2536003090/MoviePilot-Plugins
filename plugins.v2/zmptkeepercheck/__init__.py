@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -410,20 +410,19 @@ class ZmptKeeperCheck(_PluginBase):
         return users, diag
 
     def _render_with_browser(self, url):
-        """调用 PlaywrightHelper 渲染页面：加载后反复滚到底部触发懒加载，再返回完整HTML。"""
+        """用 MP 内置浏览器渲染组员页：每页调到100条，并自动翻页把所有页的HTML收集起来。失败重试一次。"""
         try:
             from app.helper.browser import PlaywrightHelper
         except Exception as e:
             logger.warn(f"ZMPT PlaywrightHelper 不可用: {e}")
             return None
 
-        def _scroll_and_read(page):
+        def _collect(page):
             try:
                 page.set_default_timeout(20000)
             except Exception:
                 pass
-            # 关键修复：把 Cookie 写入浏览器 cookie jar（不只是 HTTP header），
-            # 这样页面里的 JS / Livewire / Filament 发 AJAX 时才能正确带 session 与 CSRF，表格才会加载。
+            # 1) 把 Cookie 写进 cookie jar 再重新加载，保证 Livewire/Filament AJAX 认证通过
             try:
                 jar = [{"name": k, "value": v, "domain": "zmpt.cc", "path": "/"}
                        for k, v in self._cookie_dict().items()]
@@ -431,52 +430,87 @@ class ZmptKeeperCheck(_PluginBase):
                     page.context.add_cookies(jar)
             except Exception as e:
                 logger.warn(f"ZMPT 写入浏览器cookie失败: {e}")
-            # 重新加载，使 cookie jar 生效
             try:
                 page.goto(url)
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
-            # 尝试直接调用 Livewire/Filament 触发表格加载
+            # 2) 每页条数调到 100（Filament 的 tableRecordsPerPage）
             try:
                 page.evaluate("""() => {
                     try {
                         const L = window.Livewire;
-                        if (L) {
-                            const comps = L.all ? L.all() : (L.getComponents ? L.getComponents() : []);
-                            comps.forEach(c => ['loadTable','loadRecords'].forEach(m => { try { c.call(m); } catch(e){} }));
-                        }
+                        const comps = L ? (L.all ? L.all() : (L.getComponents ? L.getComponents() : [])) : [];
+                        comps.forEach(c => { try { c.set('tableRecordsPerPage', 100); } catch(e){} });
                     } catch(e){}
                 }""")
-            except Exception:
-                pass
-            # 增量缓慢滚动，让表格进入视口触发 IntersectionObserver 懒加载
-            try:
-                page.evaluate("""() => new Promise(async (resolve) => {
-                    const total = document.body.scrollHeight;
-                    for (let y = 0; y <= total + 800; y += 350) {
-                        window.scrollTo(0, y);
-                        await new Promise(r => setTimeout(r, 350));
-                    }
-                    resolve();
-                })""")
-            except Exception:
-                pass
-            try:
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
+            # 3) 触发表格加载 + 轻量滚动
             try:
-                return page.content()
+                page.evaluate("""() => {
+                    try {
+                        const L = window.Livewire;
+                        const comps = L ? (L.all ? L.all() : (L.getComponents ? L.getComponents() : [])) : [];
+                        comps.forEach(c => ['loadTable','loadRecords'].forEach(m => { try { c.call(m); } catch(e){} }));
+                    } catch(e){}
+                    window.scrollTo(0, document.body.scrollHeight);
+                }""")
+                page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
-                return None
+                pass
+            # 4) 翻页收集：读取当前页，若有可用“下一页”则翻页继续，最多20页
+            parts = []
+            try:
+                parts.append(page.content())
+            except Exception:
+                parts.append("")
+            for _ in range(20):
+                try:
+                    has_next = page.evaluate("""() => {
+                        try {
+                            const btns = Array.from(document.querySelectorAll('button, a'));
+                            const next = btns.find(b => (b.getAttribute('wire:click') || '').includes('nextPage'));
+                            if (!next) return false;
+                            if (next.disabled) return false;
+                            if (next.getAttribute('aria-disabled') === 'true') return false;
+                            if (Array.from(next.classList).some(c => /disabled|not-allowed/.test(c))) return false;
+                            return true;
+                        } catch(e){ return false; }
+                    }""")
+                except Exception:
+                    has_next = False
+                if not has_next:
+                    break
+                try:
+                    page.evaluate("""() => {
+                        try {
+                            const L = window.Livewire;
+                            const comps = L ? (L.all ? L.all() : (L.getComponents ? L.getComponents() : [])) : [];
+                            comps.forEach(c => { try { c.call('nextPage'); } catch(e){} });
+                        } catch(e){}
+                    }""")
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                    try:
+                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
+                    parts.append(page.content())
+                except Exception:
+                    break
+            return "\n".join(parts)
 
-        try:
-            return PlaywrightHelper().action(url, _scroll_and_read,
-                                             cookies=self._cookie, headless=True, timeout=180)
-        except Exception as e:
-            logger.warn(f"ZMPT 浏览器渲染失败: {e}")
-            return None
+        for attempt in range(2):
+            try:
+                html = PlaywrightHelper().action(url, _collect,
+                                                 cookies=self._cookie, headless=True, timeout=240)
+                if html:
+                    return html
+            except Exception as e:
+                logger.warn(f"ZMPT 浏览器渲染失败(第{attempt+1}次): {e}")
+        return None
 
     @staticmethod
     def _extract_uid(href):
