@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -405,7 +405,7 @@ class ZmptKeeperCheck(_PluginBase):
         if not html:
             return [], f"内置浏览器渲染失败/超时（请确认MP已安装Playwright浏览器内核）| URL={url}"
         users = self._parse_users(html, role_id=role_id)
-        diag = self._build_diag(url, html, 200, len(html))
+        diag = "[浏览器模式] " + self._build_diag(url, html, 200, len(html))
         return users, diag
 
     def _render_with_browser(self, url):
@@ -421,11 +421,23 @@ class ZmptKeeperCheck(_PluginBase):
                 page.set_default_timeout(15000)
             except Exception:
                 pass
-            # 反复滚到底部，触发 Filament 表格的懒加载/无限滚动
-            for _ in range(12):
+            # 先等首屏可能的首批加载
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            # 反复滚动主窗口 + 所有嵌套滚动容器，触发 Filament 表格的 IntersectionObserver 懒加载
+            for _ in range(15):
                 try:
-                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                    page.evaluate("() => new Promise(r => setTimeout(r, 800))")
+                    page.evaluate("""() => {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        document.querySelectorAll('div, section, main').forEach(el => {
+                            if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 120) {
+                                el.scrollTop = el.scrollHeight;
+                            }
+                        });
+                    }""")
+                    page.evaluate("() => new Promise(r => setTimeout(r, 700))")
                 except Exception:
                     break
             try:
