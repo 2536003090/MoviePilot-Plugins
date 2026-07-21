@@ -1,3 +1,5 @@
+import html
+import json
 import re
 import time
 import traceback
@@ -24,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -346,7 +348,8 @@ class ZmptKeeperCheck(_PluginBase):
             if samples:
                 parts.append("疑似用户链接样本: " + " | ".join(samples))
             else:
-                parts.append("未发现任何疑似用户链接（组员可能是JS动态加载）")
+                parts.append("静态HTML无用户链接")
+            parts.append("Livewire: " + self._snapshot_summary(text))
         elif status == 200:
             parts.append("HTTP 200 但响应为空")
         return " | ".join(parts) + f" | URL={url}"
@@ -397,7 +400,14 @@ class ZmptKeeperCheck(_PluginBase):
         return None
 
     def _parse_users(self, html):
-        soup = BeautifulSoup(html, "html.parser")
+        """先按页面 <a> 链接解析；链接找不到时回退到 Livewire snapshot 取组员。"""
+        users = self._parse_users_from_links(html)
+        if users:
+            return users
+        return self._users_from_snapshots(html)
+
+    def _parse_users_from_links(self, html_text):
+        soup = BeautifulSoup(html_text, "html.parser")
         users = []
         seen = set()
         for a in soup.find_all("a", href=True):
@@ -411,6 +421,95 @@ class ZmptKeeperCheck(_PluginBase):
             level = self._level_from_tr(table, tr) if table else ""
             users.append({"id": uid, "name": name, "level": level, "href": a["href"]})
         return users
+
+    # ---------- Livewire snapshot 解析（zmpt 用 Laravel/Livewire，组员在 wire:snapshot 的 JSON 里）----------
+    _SNAPSHOT_ATTRS = ("wire:snapshot", "wire:initial-data")
+    _UID_KEYS = ("id", "uid", "user_id", "userid")
+    _NAME_KEYS = ("username", "name", "user_name", "uname", "nick", "nickname")
+
+    def _iter_snapshots(self, html_text):
+        """解码页面里所有 Livewire snapshot（wire:snapshot / wire:initial-data），产出 dict。"""
+        soup = BeautifulSoup(html_text, "html.parser")
+        for attr in self._SNAPSHOT_ATTRS:
+            for el in soup.find_all(attrs={attr: True}):
+                raw = el.get(attr)
+                if not raw:
+                    continue
+                try:
+                    yield json.loads(html.unescape(raw))
+                except Exception:
+                    continue
+
+    def _users_from_snapshots(self, html_text):
+        users = []
+        seen = set()
+        try:
+            snaps = list(self._iter_snapshots(html_text))
+            for uid, name in self._scan_user_collection(snaps):
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                users.append({"id": uid, "name": name or f"id:{uid}", "level": "", "href": ""})
+        except Exception as e:
+            logger.warn(f"ZMPT Livewire snapshot 解析失败: {e}")
+        return users
+
+    def _scan_user_collection(self, obj, out=None):
+        """递归扫描 snapshot，找出形似"用户集合"的列表，收集 (uid, name)。"""
+        if out is None:
+            out = []
+        if isinstance(obj, list):
+            if obj and all(isinstance(x, dict) for x in obj[:6]):
+                idkey = namekey = None
+                for x in obj[:6]:
+                    if idkey is None:
+                        for k in self._UID_KEYS:
+                            if k in x:
+                                idkey = k
+                                break
+                    if namekey is None:
+                        for k in self._NAME_KEYS:
+                            if k in x:
+                                namekey = k
+                                break
+                if idkey:
+                    for x in obj:
+                        if isinstance(x, dict):
+                            v = x.get(idkey)
+                            if v is not None and str(v).strip().isdigit():
+                                nm = str(x.get(namekey, "")).strip() if namekey else ""
+                                out.append((str(v).strip(), nm))
+            for x in obj:
+                self._scan_user_collection(x, out)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                self._scan_user_collection(v, out)
+        return out
+
+    def _snapshot_summary(self, html_text):
+        """诊断用：概览页面里的 Livewire snapshot 结构与扫到的用户数。"""
+        try:
+            snaps = list(self._iter_snapshots(html_text))
+        except Exception as e:
+            return f"snapshot读取异常: {e}"
+        if not snaps:
+            return "无 wire:snapshot（页面可能不是Livewire，或snapshot在别处）"
+        parts = []
+        for i, snap in enumerate(snaps[:3]):
+            if isinstance(snap, dict):
+                top = list(snap.keys())
+                data = snap.get("data")
+                dkeys = list(data.keys()) if isinstance(data, dict) else []
+                parts.append(f"#{i} keys={top} datakeys={dkeys}")
+            else:
+                parts.append(f"#{i} 非dict")
+        try:
+            scanned = self._scan_user_collection(snaps)
+            sample = ", ".join(f"{u}={n}" for u, n in scanned[:3])
+            parts.append(f"扫到用户数={len(scanned)} 样本={sample}")
+        except Exception as e:
+            parts.append(f"扫描异常: {e}")
+        return " | ".join(parts)
 
     def _level_from_tr(self, table, tr):
         if not table or not tr:
