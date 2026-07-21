@@ -24,7 +24,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -313,6 +313,23 @@ class ZmptKeeperCheck(_PluginBase):
     def _http_get(self, url):
         return self._http_get_diag(url)[0]
 
+    @staticmethod
+    def _sample_user_links(html):
+        """提取若干疑似用户主页链接样本，供诊断输出，定位组员链接格式。"""
+        soup = BeautifulSoup(html, "html.parser")
+        samples, seen = [], set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href or href.startswith(("#", "javascript")):
+                continue
+            if ZmptKeeperCheck._extract_uid(href):
+                if href not in seen:
+                    seen.add(href)
+                    samples.append(href)
+            if len(samples) >= 8:
+                break
+        return samples
+
     def _build_diag(self, url, text, status, length):
         """构造可读的诊断串，帮助定位 抓不到组员 的原因。"""
         if status is None:
@@ -320,11 +337,16 @@ class ZmptKeeperCheck(_PluginBase):
         parts = [f"HTTP {status}", f"长度 {length}"]
         if text:
             low = text.lower()
-            if (any(k in text for k in ("登录", "请先登录", "您还没有登录", "还未登录", "userlogin", "takelogin"))
-                    or "login.php" in low or "takelogin" in low):
-                parts.append("疑似登录页（Cookie 可能已失效）")
-            snippet = re.sub(r"\s+", " ", text).strip()[:160]
-            parts.append(f"片段: {snippet}")
+            # 登录页判定：必须有登录表单特征，避免导航栏“登录”字样误判
+            is_login = ("takelogin" in low
+                        or ('name="username"' in low and "password" in low)
+                        or ("login" in low and "password" in low and "<form" in low))
+            parts.append("疑似登录页（Cookie 可能已失效）" if is_login else "页面正常（非登录页）")
+            samples = self._sample_user_links(text)
+            if samples:
+                parts.append("疑似用户链接样本: " + " | ".join(samples))
+            else:
+                parts.append("未发现任何疑似用户链接（组员可能是JS动态加载）")
         elif status == 200:
             parts.append("HTTP 200 但响应为空")
         return " | ".join(parts) + f" | URL={url}"
@@ -359,20 +381,35 @@ class ZmptKeeperCheck(_PluginBase):
             time.sleep(self._delay)
         return users, diag
 
+    @staticmethod
+    def _extract_uid(href):
+        """从用户主页链接里提取数字ID，兼容 nexusphp 与 Laravel 风格。"""
+        if not href:
+            return None
+        # ?id=123 / &userid=123 / &uid=123
+        m = re.search(r'[?&](?:id|userid|uid)=(\d+)', href, re.I)
+        if m:
+            return m.group(1)
+        # /user/123 /users/123 /profile/123 /member/123 （路径段为纯数字）
+        m = re.search(r'/(?:users?|profile|member)/(\d+)(?:[/?#]|$)', href, re.I)
+        if m:
+            return m.group(1)
+        return None
+
     def _parse_users(self, html):
         soup = BeautifulSoup(html, "html.parser")
         users = []
-        for a in soup.select('a[href*="userdetails"]'):
-            href = a.get("href", "")
-            m = re.search(r'[?&](?:id|userid|uid)=(\d+)', href)
-            if not m:
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            uid = self._extract_uid(a["href"])
+            if not uid or uid in seen:
                 continue
-            uid = m.group(1)
+            seen.add(uid)
             name = a.get_text(strip=True) or f"id:{uid}"
             tr = a.find_parent("tr")
             table = tr.find_parent("table") if tr else None
             level = self._level_from_tr(table, tr) if table else ""
-            users.append({"id": uid, "name": name, "level": level, "href": href})
+            users.append({"id": uid, "name": name, "level": level, "href": a["href"]})
         return users
 
     def _level_from_tr(self, table, tr):
