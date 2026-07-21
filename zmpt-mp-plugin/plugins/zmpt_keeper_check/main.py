@@ -1,0 +1,366 @@
+import re
+import time
+import traceback
+from datetime import datetime
+
+from bs4 import BeautifulSoup
+
+from app.log import logger
+from app.plugins import _PluginBase
+from app.schemas.types import EventType
+from app.utils.http import RequestUtils
+
+
+class ZmptKeeperCheck(_PluginBase):
+    """ZMPT 保种组检查：定时抓取组员官种体积，判定合格/不合格，10T组按公式算工资，结果推送通知。"""
+
+    # 插件元信息
+    plugin_name = "ZMPT保种组检查"
+    plugin_desc = "定时抓取 ZMPT 保种组官种体积，判定合格/不合格；10T组按 200000+(取整T-5)*50000 算工资；结果以纯文本推送到通知渠道。"
+    plugin_version = "1.0"
+    plugin_author = "you"
+    plugin_icon = ""
+    plugin_config_prefix = "zmptkeeper_"
+    plugin_order = 28
+    auth_level = 1
+
+    # 默认配置
+    _enabled = False
+    _cookie = ""
+    _base = "https://zmpt.cc"
+    _cron = "0 8 * * *"          # 每天 8 点（cron5：分 时 日 月 周）
+    _notify = True
+    _delay = 1.0                 # 每次请求间隔(秒)，降低服务器压力
+    _groups = []                 # [{id,name,threshold,payroll}]
+    _payroll = {"base": 200000, "per_tb": 50000, "base_tb": 5, "min_tb": 10}
+
+    def init_plugin(self, config: dict = None):
+        if not config:
+            return
+        self._enabled = bool(config.get("enabled"))
+        self._cookie = (config.get("cookie") or "").strip()
+        self._cron = (config.get("cron") or "0 8 * * *").strip()
+        self._notify = config.get("notify") is not False
+        try:
+            self._delay = float(config.get("delay") or 1.0)
+        except Exception:
+            self._delay = 1.0
+        self._groups = self._parse_groups_config(config.get("groups"))
+        logger.info(f"ZMPT保种组检查 已加载：enabled={self._enabled} cron={self._cron} groups={self._groups}")
+
+    @staticmethod
+    def _parse_groups_config(raw):
+        """raw 格式: id:名称:阈值T:是否算工资(1/0)，多组用分号分隔。空则用默认两组。"""
+        if not raw:
+            return [
+                {"id": "6", "name": "5T组", "threshold": 5.0, "payroll": False},
+                {"id": "10", "name": "10T组", "threshold": 10.0, "payroll": True},
+            ]
+        result = []
+        for part in str(raw).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            seg = part.split(":")
+            if len(seg) < 3:
+                continue
+            try:
+                result.append({
+                    "id": seg[0].strip(),
+                    "name": seg[1].strip(),
+                    "threshold": float(seg[2]),
+                    "payroll": len(seg) > 3 and seg[3].strip() in ("1", "true", "yes"),
+                })
+            except Exception:
+                continue
+        return result
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> list:
+        return []
+
+    def get_service(self) -> list:
+        """定时任务：交给 MoviePilot 调度器，按 cron5 表达式触发"""
+        if not self._enabled or not self._cron:
+            return []
+        return [{
+            "id": "ZmptKeeperCheck",
+            "name": "ZMPT保种组检查",
+            "trigger": "cron",
+            "func": self.check,
+            "kwargs": {"cron": self._cron},
+        }]
+
+    def stop_service(self):
+        # 定时任务由框架统一管理，无需手动释放
+        pass
+
+    def get_form(self):
+        """前端配置表单（VNode）。注意：model/key 放顶层；不同 MP 版本若不显示，把它移到 props 内即可。"""
+        return [
+            {"component": "VForm", "content": [
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VSwitch", "props": {"label": "启用插件"}, "model": "enabled", "key": "enabled"},
+                    ]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VSwitch", "props": {"label": "推送通知"}, "model": "notify", "key": "notify"},
+                    ]},
+                ]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VTextarea", "props": {"label": "ZMPT Cookie", "rows": 3,
+                                                              "placeholder": "从浏览器复制 zmpt.cc 的 Cookie（至少含 session）"}, "model": "cookie", "key": "cookie"},
+                    ]},
+                ]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VTextField", "props": {"label": "定时 cron（5字段：分 时 日 月 周）",
+                                                              "placeholder": "0 8 * * *（每天8点）"}, "model": "cron", "key": "cron"},
+                    ]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VTextField", "props": {"label": "请求间隔(秒)", "placeholder": "1.0"},
+                                                              "model": "delay", "key": "delay"},
+                    ]},
+                ]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VTextField", "props": {"label": "组配置（id:名称:阈值T:是否算工资1/0，分号分隔）",
+                                                              "placeholder": "6:5T组:5:0;10:10T组:10:1"}, "model": "groups", "key": "groups"},
+                    ]},
+                ]},
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text":
+                    "工资公式：200000 + (取整T − 5) × 50000，取整T ≥ 10 才发。结果以纯文本推送到通知渠道（微信/TG等），你复制粘贴到金山文档。"}},
+            ]},
+        ]
+
+    # ====================== 核心流程 ======================
+    def check(self):
+        if not self._enabled:
+            return
+        if not self._cookie:
+            logger.warn("ZMPT保种组检查：未配置 Cookie，跳过")
+            self._notify_msg("ZMPT保种组检查", "⚠️ 未配置 Cookie，无法抓取。请在插件设置填入 zmpt.cc 的 Cookie。")
+            return
+        logger.info("ZMPT保种组检查：开始执行")
+        for g in self._groups:
+            try:
+                self._check_group(g)
+            except Exception as e:
+                logger.error(f"ZMPT保种组检查 组{g.get('id')} 出错: {e}")
+                logger.error(traceback.format_exc())
+        logger.info("ZMPT保种组检查：执行完成")
+
+    def _check_group(self, g):
+        users = self._fetch_users(g["id"])
+        if not users:
+            self._notify_msg(f"ZMPT {g['name']}", f"⚠️ 未抓到组员（组id={g['id']}），请检查 Cookie 或页面分页结构。")
+            return
+        rows = []
+        ok_n = bad_n = err_n = 0
+        total_pay = 0
+        for u in users:
+            vol = self._fetch_volume(u["id"])
+            if vol is None:
+                err_n += 1
+                status, volstr, intt, salary = "异常", "未知", "-", None
+            else:
+                intt = int(vol)  # 向下取整
+                volstr = f"{vol:.3f} TB"
+                if vol >= g["threshold"]:
+                    ok_n += 1
+                    status = "合格"
+                else:
+                    bad_n += 1
+                    status = "不合格"
+                salary = self._calc_salary(vol) if g.get("payroll") else None
+                if salary:
+                    total_pay += salary
+            rows.append({"id": u["id"], "name": u["name"], "level": u["level"],
+                         "vol": volstr, "intt": intt, "salary": salary, "status": status})
+            time.sleep(self._delay)
+        text = self._format_text(g, rows, ok_n, bad_n, err_n, total_pay)
+        self._notify_msg(f"ZMPT {g['name']} 审查结果", text)
+
+    def _format_text(self, g, rows, ok_n, bad_n, err_n, total_pay):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        lines = [
+            f"抓取时间：{now}",
+            f"{g['name']} · 阈值 ≥ {g['threshold']:.0f} TB 合格 · 共 {len(rows)} 人（合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}）",
+        ]
+        if g.get("payroll"):
+            lines.append(f"发工资合计：{total_pay:,}（公式 200000+(取整T-5)×50000，取整T≥10 才发）")
+        lines.append("")
+        lines.append("ID\t用户名\t等级\t官种体积\t取整T\t工资\t结果")
+        for r in rows:
+            pay = f"{r['salary']:,}" if r["salary"] else "-"
+            lines.append(f"{r['id']}\t{r['name']}\t{r['level'] or '-'}\t{r['vol']}\t{r['intt']}\t{pay}\t{r['status']}")
+        return "\n".join(lines)
+
+    # ====================== HTTP ======================
+    def _cookie_dict(self):
+        d = {}
+        if not self._cookie:
+            return d
+        for pair in self._cookie.split(";"):
+            if "=" in pair:
+                k, v = pair.strip().split("=", 1)
+                if k.strip():
+                    d[k.strip()] = v.strip()
+        return d
+
+    def _http_get(self, url):
+        try:
+            res = RequestUtils(cookies=self._cookie_dict(), timeout=30, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }).get_res(url)
+            if res and res.status_code == 200:
+                return res.text
+            logger.warn(f"ZMPT请求 非200 {url}: status={getattr(res, 'status_code', None)}")
+        except Exception as e:
+            logger.warn(f"ZMPT请求失败 {url}: {e}")
+        return None
+
+    # ====================== 抓组员（复用油猴已验证逻辑）======================
+    def _fetch_users(self, role_id):
+        users = []
+        seen = set()
+        page = 1
+        while page <= 50:
+            # 尝试 URL 分页（Filament 通常同步 ?page= 到 URL）
+            url = f"{self._base}/nexusphp/roles/{role_id}/edit?page={page}"
+            html = self._http_get(url)
+            if not html:
+                break
+            page_users = self._parse_users(html)
+            if not page_users:
+                break
+            new = 0
+            for u in page_users:
+                if u["id"] not in seen:
+                    seen.add(u["id"])
+                    users.append(u)
+                    new += 1
+            if new == 0:
+                break
+            page += 1
+            time.sleep(self._delay)
+        return users
+
+    def _parse_users(self, html):
+        soup = BeautifulSoup(html, "lxml")
+        users = []
+        for a in soup.select('a[href*="userdetails"]'):
+            href = a.get("href", "")
+            m = re.search(r'[?&](?:id|userid|uid)=(\d+)', href)
+            if not m:
+                continue
+            uid = m.group(1)
+            name = a.get_text(strip=True) or f"id:{uid}"
+            tr = a.find_parent("tr")
+            table = tr.find_parent("table") if tr else None
+            level = self._level_from_tr(table, tr) if table else ""
+            users.append({"id": uid, "name": name, "level": level, "href": href})
+        return users
+
+    def _level_from_tr(self, table, tr):
+        if not table or not tr:
+            return ""
+        head = table.find("tr")
+        if not head:
+            return ""
+        lvl_col = -1
+        for i, c in enumerate(head.find_all(["th", "td"])):
+            txt = c.get_text(strip=True)
+            if any(kw in txt for kw in ("等级", "用户组", "class", "level", "group")):
+                lvl_col = i
+                break
+        if lvl_col < 0:
+            return ""
+        cells = tr.find_all("td")
+        if lvl_col < len(cells):
+            return cells[lvl_col].get_text(strip=True)
+        return ""
+
+    # ====================== 抓官种体积（复用油猴已验证逻辑）======================
+    def _fetch_volume(self, uid):
+        html = self._http_get(f"{self._base}/userdetails.php?id={uid}")
+        if not html:
+            return None
+        return self._extract_volume(html)
+
+    def _extract_volume(self, html):
+        soup = BeautifulSoup(html, "lxml")
+        # 找含"官种加成"的最小容器（优先 tr）
+        scope, scope_len = None, None
+        for el in soup.select("tr, table, tbody, dl, div, section, fieldset"):
+            try:
+                txt = el.get_text()
+            except Exception:
+                continue
+            if "官种加成" in txt and len(txt) < 600:
+                s = len(str(el))
+                if scope is None or s < scope_len:
+                    scope, scope_len = el, s
+        # 策略A：容器内"整个单元格=数字+单位"
+        if scope:
+            for c in scope.select("td, th, dd, li, span, div"):
+                t = c.get_text(strip=True)
+                if re.match(r'^\d[\d,]*\.?\d*\s*(PB|TB|GB|MB|KB|B)$', t, re.I):
+                    v = self._parse_size_tb(t)
+                    if v is not None:
+                        return v
+        # 策略0：正则兜底
+        text = soup.get_text(" ", strip=True)
+        idx = text.find("官种加成")
+        if idx < 0:
+            idx = text.find("官种")
+        if idx >= 0:
+            seg = text[idx:idx + 200]
+            m = re.search(r'(\d+\.?\d*)\s*(PB|TB|GB|MB|KB|B)', seg, re.I)
+            if m:
+                return self._parse_size_tb(m.group(1) + m.group(2))
+        return None
+
+    @staticmethod
+    def _parse_size_tb(text):
+        if text is None:
+            return None
+        s = re.sub(r',', '', str(text)).strip()
+        m = re.match(r'([-+]?\d*\.?\d+)\s*(PB|TB|GB|MB|KB|TiB|GiB|MiB|PiB|B)?', s, re.I)
+        if not m:
+            return None
+        try:
+            num = float(m.group(1))
+        except Exception:
+            return None
+        unit = (m.group(2) or "TB").upper().replace("IB", "B")
+        factor = {"PB": 1024, "TB": 1, "GB": 1 / 1024, "MB": 1 / 1024 ** 2, "KB": 1 / 1024 ** 3, "B": 1 / 1024 ** 4}
+        return num * factor.get(unit, 1)
+
+    def _calc_salary(self, vol):
+        if vol is None:
+            return None
+        x = int(vol)  # 向下取整
+        if x < self._payroll["min_tb"]:
+            return None
+        return self._payroll["base"] + (x - self._payroll["base_tb"]) * self._payroll["per_tb"]
+
+    # ====================== 通知 ======================
+    def _notify_msg(self, title, text):
+        logger.info(f"[{title}] 通知内容:\n{text}")
+        if not self._notify:
+            return
+        try:
+            self.eventmanager.send_event(EventType.Notification, {
+                "channel": None,
+                "title": title,
+                "text": text,
+                "image": "",
+                "userid": None,
+            })
+        except Exception as e:
+            logger.error(f"通知发送失败: {e}\n{text[:500]}")
