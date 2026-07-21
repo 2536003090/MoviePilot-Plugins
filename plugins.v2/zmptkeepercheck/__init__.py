@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -281,15 +281,20 @@ class ZmptKeeperCheck(_PluginBase):
 
     def _format_text(self, g, rows, ok_n, bad_n, err_n):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        bad_rows = [r for r in rows if r["status"] == "不合格"]
         lines = [
             f"插件版本：v{self.plugin_version}（{'浏览器模式' if self._use_browser else '普通模式'}）",
             f"抓取时间：{now}",
-            f"{g['name']} · 阈值 ≥ {g['threshold']:.0f} TB 合格 · 共 {len(rows)} 人（合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}）",
+            f"{g['name']} · 阈值 ≥ {g['threshold']:.0f} TB · 共 {len(rows)} 人（合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}）",
         ]
-        lines.append("")
-        lines.append("ID\t用户名\t等级\t官种体积\t取整T\t结果")
-        for r in rows:
-            lines.append(f"{r['id']}\t{r['name']}\t{r['level'] or '-'}\t{r['vol']}\t{r['intt']}\t{r['status']}")
+        if bad_rows:
+            lines.append("")
+            lines.append(f"不合格组员（{len(bad_rows)} 人）：")
+            lines.append("ID\t用户名\t官种体积")
+            for r in bad_rows:
+                lines.append(f"{r['id']}\t{r['name']}\t{r['vol']}")
+        else:
+            lines.append("✅ 全部合格，无不合格组员。")
         return "\n".join(lines)
 
     # ====================== HTTP ======================
