@@ -3,7 +3,7 @@
     "name": "ZMPT Keeper Check",
     "description": "Periodically fetch ZMPT seed-group official-seed volume and judge pass/fail against the group threshold; push plain-text result to notification channel.",
     "labels": "seed",
-    "version": "1.0.9",
+    "version": "1.1.0",
     "icon": "Moviepilot_A.png",
     "author": "2536003090",
     "level": 1

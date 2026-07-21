@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.9"
+    plugin_version = "1.1.0"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -419,30 +419,51 @@ class ZmptKeeperCheck(_PluginBase):
 
         def _scroll_and_read(page):
             try:
-                page.set_default_timeout(15000)
+                page.set_default_timeout(20000)
             except Exception:
                 pass
-            # 先等首屏可能的首批加载
+            # 关键修复：把 Cookie 写入浏览器 cookie jar（不只是 HTTP header），
+            # 这样页面里的 JS / Livewire / Filament 发 AJAX 时才能正确带 session 与 CSRF，表格才会加载。
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
+                jar = [{"name": k, "value": v, "domain": "zmpt.cc", "path": "/"}
+                       for k, v in self._cookie_dict().items()]
+                if jar:
+                    page.context.add_cookies(jar)
+            except Exception as e:
+                logger.warn(f"ZMPT 写入浏览器cookie失败: {e}")
+            # 重新加载，使 cookie jar 生效
+            try:
+                page.goto(url)
+                page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
-            # 反复滚动主窗口 + 所有嵌套滚动容器，触发 Filament 表格的 IntersectionObserver 懒加载
-            for _ in range(15):
-                try:
-                    page.evaluate("""() => {
-                        window.scrollTo(0, document.body.scrollHeight);
-                        document.querySelectorAll('div, section, main').forEach(el => {
-                            if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 120) {
-                                el.scrollTop = el.scrollHeight;
-                            }
-                        });
-                    }""")
-                    page.evaluate("() => new Promise(r => setTimeout(r, 700))")
-                except Exception:
-                    break
+            # 尝试直接调用 Livewire/Filament 触发表格加载
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.evaluate("""() => {
+                    try {
+                        const L = window.Livewire;
+                        if (L) {
+                            const comps = L.all ? L.all() : (L.getComponents ? L.getComponents() : []);
+                            comps.forEach(c => ['loadTable','loadRecords'].forEach(m => { try { c.call(m); } catch(e){} }));
+                        }
+                    } catch(e){}
+                }""")
+            except Exception:
+                pass
+            # 增量缓慢滚动，让表格进入视口触发 IntersectionObserver 懒加载
+            try:
+                page.evaluate("""() => new Promise(async (resolve) => {
+                    const total = document.body.scrollHeight;
+                    for (let y = 0; y <= total + 800; y += 350) {
+                        window.scrollTo(0, y);
+                        await new Promise(r => setTimeout(r, 350));
+                    }
+                    resolve();
+                })""")
+            except Exception:
+                pass
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
             try:
@@ -452,7 +473,7 @@ class ZmptKeeperCheck(_PluginBase):
 
         try:
             return PlaywrightHelper().action(url, _scroll_and_read,
-                                             cookies=self._cookie, headless=True, timeout=120)
+                                             cookies=self._cookie, headless=True, timeout=180)
         except Exception as e:
             logger.warn(f"ZMPT 浏览器渲染失败: {e}")
             return None
