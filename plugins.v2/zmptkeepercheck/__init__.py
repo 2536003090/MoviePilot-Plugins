@@ -24,7 +24,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -171,8 +171,8 @@ class ZmptKeeperCheck(_PluginBase):
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                        {"component": "VTextField", "props": {"model": "cron",
-                            "label": "定时 cron（5字段：分 时 日 月 周）", "placeholder": "0 8 * * *（每天8点）"}},
+                        {"component": "VCronField", "props": {"model": "cron",
+                            "label": "定时执行周期（cron）", "placeholder": "0 8 * * *（每天8点）"}},
                     ]},
                     {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                         {"component": "VTextField", "props": {"model": "delay", "label": "请求间隔(秒)", "placeholder": "1.0"}},
