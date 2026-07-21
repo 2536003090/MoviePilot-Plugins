@@ -21,7 +21,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -37,6 +37,7 @@ class ZmptKeeperCheck(_PluginBase):
     _delay = 1.0
     _groups = []
     _last_result = ""
+    _member_url = ""  # 组员列表URL模板，支持 {id} 和 {page} 占位符；空则用内置默认
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -49,7 +50,8 @@ class ZmptKeeperCheck(_PluginBase):
         except Exception:
             self._delay = 1.0
         self._groups = self._parse_groups_config(config.get("groups"))
-        logger.info(f"ZMPT保种组检查 已加载：enabled={self._enabled} cron={self._cron} groups={self._groups}")
+        self._member_url = (config.get("member_url") or "").strip()
+        logger.info(f"ZMPT保种组检查 已加载：enabled={self._enabled} cron={self._cron} groups={self._groups} member_url={self._member_url or '(默认)'}")
 
     @staticmethod
     def _parse_groups_config(raw):
@@ -158,8 +160,15 @@ class ZmptKeeperCheck(_PluginBase):
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VTextField", "props": {"model": "member_url",
+                            "label": "组员列表URL模板（可选，含 {id} 和 {page}）",
+                            "placeholder": "留空用默认；自定义形如 https://zmpt.cc/xxx.php?id={id}&page={page}"}},
+                    ]},
+                ]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                            "text": "保存后可在 MoviePilot 聊天框发送 /zmpt_check 立即执行一次。"}},
+                            "text": "若提示\"未抓到组员\"：用浏览器打开保种组组员列表页，把地址栏网址粘到上面的\"组员列表URL模板\"（数字换成 {id}，加 &page={page}）。保存后发送 /zmpt_check 立即执行一次。"}},
                     ]},
                 ]},
             ]},
@@ -170,6 +179,7 @@ class ZmptKeeperCheck(_PluginBase):
             "cron": "0 8 * * *",
             "delay": 1.0,
             "groups": "6:5T组:5;10:10T组:10",
+            "member_url": "",
         }
 
     def get_page(self) -> List[dict]:
@@ -208,9 +218,9 @@ class ZmptKeeperCheck(_PluginBase):
         logger.info("ZMPT保种组检查：执行完成")
 
     def _check_group(self, g):
-        users = self._fetch_users(g["id"])
+        users, diag = self._fetch_users(g["id"])
         if not users:
-            msg = f"⚠️ {g['name']}：未抓到组员（组id={g['id']}），请检查 Cookie 或分页结构。"
+            msg = f"⚠️ {g['name']}：未抓到组员（组id={g['id']}）。\n诊断：{diag}"
             self._notify_msg(f"ZMPT {g['name']}", msg)
             return msg
         rows = []
@@ -261,24 +271,57 @@ class ZmptKeeperCheck(_PluginBase):
                     d[k.strip()] = v.strip()
         return d
 
-    def _http_get(self, url):
+    @staticmethod
+    def _headers():
+        return {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    def _http_get_diag(self, url):
+        """返回 (text, status, length)；非 200 时 text=None。供诊断用。"""
         try:
-            res = RequestUtils(cookies=self._cookie_dict(), timeout=30, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            }).get_res(url)
-            if res and res.status_code == 200:
-                return res.text
-            logger.warn(f"ZMPT请求 非200 {url}: status={getattr(res, 'status_code', None)}")
+            res = RequestUtils(cookies=self._cookie_dict(), timeout=30,
+                               headers=self._headers()).get_res(url)
+            status = getattr(res, "status_code", None)
+            length = len(res.text) if res is not None else 0
+            text = res.text if (res is not None and status == 200) else None
+            if text is None and status is not None:
+                logger.warn(f"ZMPT请求 非200 {url}: status={status}")
+            return text, status, length
         except Exception as e:
             logger.warn(f"ZMPT请求失败 {url}: {e}")
-        return None
+            return None, None, 0
+
+    def _http_get(self, url):
+        return self._http_get_diag(url)[0]
+
+    def _build_diag(self, url, text, status, length):
+        """构造可读的诊断串，帮助定位 抓不到组员 的原因。"""
+        if status is None:
+            return f"请求失败/超时（网络异常或请求被拦截）| URL={url}"
+        parts = [f"HTTP {status}", f"长度 {length}"]
+        if text:
+            low = text.lower()
+            if (any(k in text for k in ("登录", "请先登录", "您还没有登录", "还未登录", "userlogin", "takelogin"))
+                    or "login.php" in low or "takelogin" in low):
+                parts.append("疑似登录页（Cookie 可能已失效）")
+            snippet = re.sub(r"\s+", " ", text).strip()[:160]
+            parts.append(f"片段: {snippet}")
+        elif status == 200:
+            parts.append("HTTP 200 但响应为空")
+        return " | ".join(parts) + f" | URL={url}"
 
     # ====================== 抓组员 ======================
     def _fetch_users(self, role_id):
         users, seen = [], set()
+        diag = ""
         page = 1
         while page <= 50:
-            html = self._http_get(f"{self._base}/nexusphp/roles/{role_id}/edit?page={page}")
+            if self._member_url:
+                url = self._member_url.replace("{id}", str(role_id)).replace("{page}", str(page))
+            else:
+                url = f"{self._base}/nexusphp/roles/{role_id}/edit?page={page}"
+            html, status, length = self._http_get_diag(url)
+            if page == 1:
+                diag = self._build_diag(url, html, status, length)
             if not html:
                 break
             page_users = self._parse_users(html)
@@ -294,7 +337,7 @@ class ZmptKeeperCheck(_PluginBase):
                 break
             page += 1
             time.sleep(self._delay)
-        return users
+        return users, diag
 
     def _parse_users(self, html):
         soup = BeautifulSoup(html, "html.parser")
