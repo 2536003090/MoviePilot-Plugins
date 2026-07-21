@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -50,6 +50,7 @@ class ZmptKeeperCheck(_PluginBase):
     _groups = []
     _last_result = ""
     _member_url = ""  # 组员列表URL模板，支持 {id} 和 {page} 占位符；空则用内置默认
+    _use_browser = False  # 用 MP 内置浏览器(Playwright)渲染页面，抓 JS 动态加载的组员
     _scheduler = None  # “立即运行一次”用的一次性调度器
 
     def init_plugin(self, config: dict = None):
@@ -66,7 +67,8 @@ class ZmptKeeperCheck(_PluginBase):
             self._delay = 1.0
         self._groups = [dict(g) for g in self._DEFAULT_GROUPS]
         self._member_url = (config.get("member_url") or "").strip()
-        logger.info(f"ZMPT保种组检查 已加载：enabled={self._enabled} cron={self._cron} onlyonce={self._onlyonce} member_url={self._member_url or '(默认)'}")
+        self._use_browser = bool(config.get("use_browser"))
+        logger.info(f"ZMPT保种组检查 已加载：enabled={self._enabled} cron={self._cron} onlyonce={self._onlyonce} use_browser={self._use_browser} member_url={self._member_url or '(默认)'}")
 
         # 立即运行一次：开关打开并保存后，3秒后触发一次检查，随后自动关闭开关
         if self._enabled and self._onlyonce:
@@ -98,6 +100,7 @@ class ZmptKeeperCheck(_PluginBase):
             "notify": self._notify,
             "delay": self._delay,
             "member_url": self._member_url,
+            "use_browser": self._use_browser,
         }
 
     def get_state(self) -> bool:
@@ -182,6 +185,12 @@ class ZmptKeeperCheck(_PluginBase):
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
+                        {"component": "VSwitch", "props": {"model": "use_browser",
+                            "label": "用内置浏览器渲染页面（组员是JS动态加载/懒加载时打开，较慢）"}},
+                    ]},
+                ]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VTextField", "props": {"model": "member_url",
                             "label": "组员列表URL模板（可选，含 {id} 和 {page}）",
                             "placeholder": "留空用默认；自定义形如 https://zmpt.cc/xxx.php?id={id}&page={page}"}},
@@ -202,6 +211,7 @@ class ZmptKeeperCheck(_PluginBase):
             "cron": "0 8 * * *",
             "delay": 1.0,
             "member_url": "",
+            "use_browser": False,
         }
 
     def get_page(self) -> List[dict]:
@@ -356,6 +366,9 @@ class ZmptKeeperCheck(_PluginBase):
 
     # ====================== 抓组员 ======================
     def _fetch_users(self, role_id):
+        # 浏览器模式：渲染页面(JS执行→Livewire表格加载→组员出现)，再解析
+        if self._use_browser:
+            return self._fetch_users_browser(role_id)
         users, seen = [], set()
         diag = ""
         page = 1
@@ -383,6 +396,53 @@ class ZmptKeeperCheck(_PluginBase):
             page += 1
             time.sleep(self._delay)
         return users, diag
+
+    def _fetch_users_browser(self, role_id):
+        """用 MP 内置浏览器渲染组员页(执行Livewire/Filament JS)，返回 (users, diag)。"""
+        url = (self._member_url.replace("{id}", str(role_id)).replace("{page}", "1")
+               if self._member_url else f"{self._base}/nexusphp/roles/{role_id}/edit?page=1")
+        html = self._render_with_browser(url)
+        if not html:
+            return [], f"内置浏览器渲染失败/超时（请确认MP已安装Playwright浏览器内核）| URL={url}"
+        users = self._parse_users(html, role_id=role_id)
+        diag = self._build_diag(url, html, 200, len(html))
+        return users, diag
+
+    def _render_with_browser(self, url):
+        """调用 PlaywrightHelper 渲染页面：加载后反复滚到底部触发懒加载，再返回完整HTML。"""
+        try:
+            from app.helper.browser import PlaywrightHelper
+        except Exception as e:
+            logger.warn(f"ZMPT PlaywrightHelper 不可用: {e}")
+            return None
+
+        def _scroll_and_read(page):
+            try:
+                page.set_default_timeout(15000)
+            except Exception:
+                pass
+            # 反复滚到底部，触发 Filament 表格的懒加载/无限滚动
+            for _ in range(12):
+                try:
+                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    page.evaluate("() => new Promise(r => setTimeout(r, 800))")
+                except Exception:
+                    break
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            try:
+                return page.content()
+            except Exception:
+                return None
+
+        try:
+            return PlaywrightHelper().action(url, _scroll_and_read,
+                                             cookies=self._cookie, headless=True, timeout=120)
+        except Exception as e:
+            logger.warn(f"ZMPT 浏览器渲染失败: {e}")
+            return None
 
     @staticmethod
     def _extract_uid(href):
