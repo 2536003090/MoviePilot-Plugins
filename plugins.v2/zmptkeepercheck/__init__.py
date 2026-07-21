@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -369,7 +369,7 @@ class ZmptKeeperCheck(_PluginBase):
                 diag = self._build_diag(url, html, status, length)
             if not html:
                 break
-            page_users = self._parse_users(html)
+            page_users = self._parse_users(html, role_id=role_id)
             if not page_users:
                 break
             new = 0
@@ -399,12 +399,12 @@ class ZmptKeeperCheck(_PluginBase):
             return m.group(1)
         return None
 
-    def _parse_users(self, html):
+    def _parse_users(self, html, role_id=None):
         """先按页面 <a> 链接解析；链接找不到时回退到 Livewire snapshot 取组员。"""
         users = self._parse_users_from_links(html)
         if users:
             return users
-        return self._users_from_snapshots(html)
+        return self._users_from_snapshots(html, exclude_id=str(role_id) if role_id else None)
 
     def _parse_users_from_links(self, html_text):
         soup = BeautifulSoup(html_text, "html.parser")
@@ -440,12 +440,14 @@ class ZmptKeeperCheck(_PluginBase):
                 except Exception:
                     continue
 
-    def _users_from_snapshots(self, html_text):
+    def _users_from_snapshots(self, html_text, exclude_id=None):
         users = []
         seen = set()
         try:
             snaps = list(self._iter_snapshots(html_text))
             for uid, name in self._scan_user_collection(snaps):
+                if exclude_id and uid == exclude_id:
+                    continue  # 跳过“当前编辑的角色”自身，避免把角色对象当成组员
                 if uid in seen:
                     continue
                 seen.add(uid)
@@ -487,7 +489,7 @@ class ZmptKeeperCheck(_PluginBase):
         return out
 
     def _snapshot_summary(self, html_text):
-        """诊断用：概览页面里的 Livewire snapshot 结构与扫到的用户数。"""
+        """诊断用：详细打印 Livewire snapshot 的 data 结构，重点暴露每个列表的字段名，用于定位组员。"""
         try:
             snaps = list(self._iter_snapshots(html_text))
         except Exception as e:
@@ -495,21 +497,30 @@ class ZmptKeeperCheck(_PluginBase):
         if not snaps:
             return "无 wire:snapshot（页面可能不是Livewire，或snapshot在别处）"
         parts = []
-        for i, snap in enumerate(snaps[:3]):
-            if isinstance(snap, dict):
-                top = list(snap.keys())
-                data = snap.get("data")
-                dkeys = list(data.keys()) if isinstance(data, dict) else []
-                parts.append(f"#{i} keys={top} datakeys={dkeys}")
-            else:
-                parts.append(f"#{i} 非dict")
-        try:
-            scanned = self._scan_user_collection(snaps)
-            sample = ", ".join(f"{u}={n}" for u, n in scanned[:3])
-            parts.append(f"扫到用户数={len(scanned)} 样本={sample}")
-        except Exception as e:
-            parts.append(f"扫描异常: {e}")
-        return " | ".join(parts)
+        for si, snap in enumerate(snaps[:2]):
+            if not isinstance(snap, dict):
+                parts.append(f"#{si} 非dict")
+                continue
+            data = snap.get("data")
+            if not isinstance(data, dict):
+                sm = snap.get("serverMemo")
+                data = sm.get("data") if isinstance(sm, dict) else None
+            if not isinstance(data, dict):
+                parts.append(f"#{si} topkeys={list(snap.keys())}（无data）")
+                continue
+            bits = [f"#{si} datakeys={list(data.keys())}"]
+            for k, v in data.items():
+                lst = v if isinstance(v, list) else (
+                    v.get("data") if isinstance(v, dict) and isinstance(v.get("data"), list) else None)
+                if isinstance(lst, list):
+                    fields = list(lst[0].keys())[:12] if lst and isinstance(lst[0], dict) else "(非dict)"
+                    bits.append(f"「{k}」=列表[{len(lst)}项]字段{fields}")
+                elif isinstance(v, dict):
+                    bits.append(f"「{k}」=dict{list(v.keys())[:8]}")
+                else:
+                    bits.append(f"「{k}」={str(v)[:30]}")
+            parts.append(" ".join(bits))
+        return " || ".join(parts)
 
     def _level_from_tr(self, table, tr):
         if not table or not tr:
