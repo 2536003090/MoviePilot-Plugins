@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -440,28 +440,39 @@ class ZmptKeeperCheck(_PluginBase):
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
-            # 2) 每页条数调到 100（Filament 的 tableRecordsPerPage）
+            # 2) 设每页100 + 触发 loadTable（用 wire:id + Livewire.find 精准调用，比 .all() 稳）
             try:
                 page.evaluate("""() => {
                     try {
                         const L = window.Livewire;
-                        const comps = L ? (L.all ? L.all() : (L.getComponents ? L.getComponents() : [])) : [];
-                        comps.forEach(c => { try { c.set('tableRecordsPerPage', 100); } catch(e){} });
+                        if (L && L.find) {
+                            const els = document.getElementsByTagName('*');
+                            for (const el of els) {
+                                const id = el.getAttribute && el.getAttribute('wire:id');
+                                if (id) {
+                                    const comp = L.find(id);
+                                    if (comp) {
+                                        try { comp.set('tableRecordsPerPage', 100); } catch(e){}
+                                        ['loadTable','loadRecords'].forEach(m => { try { comp.call(m); } catch(e){} });
+                                    }
+                                }
+                            }
+                        }
                     } catch(e){}
                 }""")
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
-            # 3) 触发表格加载 + 轻量滚动
+            # 3) 增量缓慢滚动整页（v1.1.0 验证过：能稳定触发 Filament 的 IntersectionObserver 懒加载）
             try:
-                page.evaluate("""() => {
-                    try {
-                        const L = window.Livewire;
-                        const comps = L ? (L.all ? L.all() : (L.getComponents ? L.getComponents() : [])) : [];
-                        comps.forEach(c => ['loadTable','loadRecords'].forEach(m => { try { c.call(m); } catch(e){} }));
-                    } catch(e){}
-                    window.scrollTo(0, document.body.scrollHeight);
-                }""")
+                page.evaluate("""() => new Promise(async (resolve) => {
+                    const total = document.body.scrollHeight;
+                    for (let y = 0; y <= total + 800; y += 350) {
+                        window.scrollTo(0, y);
+                        await new Promise(r => setTimeout(r, 350));
+                    }
+                    resolve();
+                })""")
                 page.wait_for_load_state("networkidle", timeout=20000)
             except Exception:
                 pass
@@ -492,8 +503,13 @@ class ZmptKeeperCheck(_PluginBase):
                     page.evaluate("""() => {
                         try {
                             const L = window.Livewire;
-                            const comps = L ? (L.all ? L.all() : (L.getComponents ? L.getComponents() : [])) : [];
-                            comps.forEach(c => { try { c.call('nextPage'); } catch(e){} });
+                            if (L && L.find) {
+                                const els = document.getElementsByTagName('*');
+                                for (const el of els) {
+                                    const id = el.getAttribute && el.getAttribute('wire:id');
+                                    if (id) { try { L.find(id).call('nextPage'); } catch(e){} }
+                                }
+                            }
                         } catch(e){}
                     }""")
                     page.wait_for_load_state("networkidle", timeout=20000)
