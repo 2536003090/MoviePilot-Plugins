@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -403,16 +403,158 @@ class ZmptKeeperCheck(_PluginBase):
             time.sleep(self._delay)
         return users, diag
 
+    # 移植自油猴脚本 zmpt-官种体积检查.user.js：设每页100 + 点“下一页”翻页，返回组员列表 [{id,name,href,level}]
+    _FETCH_ALL_JS = r"""
+async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const textOf = (n) => { if (!n) return ''; return (n.textContent || n.innerText || '').trim(); };
+  const sig = () => {
+    const rows = document.querySelectorAll('table tbody tr, table tr');
+    let s = rows.length + '|', n = 0;
+    for (const r of rows) { if (n >= 3) break; s += textOf(r).replace(/\s+/g, '').slice(0, 24) + '#'; n++; }
+    return s;
+  };
+  const waitStable = async (prev, timeout) => {
+    timeout = timeout || 12000;
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) { await sleep(150); if (sig() !== prev) break; }
+    let last = sig(), since = Date.now();
+    while (Date.now() - t0 < timeout) {
+      await sleep(200);
+      const cur = sig();
+      if (cur === last) { if (Date.now() - since > 600) return cur; } else { last = cur; since = Date.now(); }
+    }
+    return sig();
+  };
+  // 触发 Filament 表格懒加载：反复 loadTable + scrollIntoView，直到出现组员链接
+  for (let i = 0; i < 20; i++) {
+    if (document.querySelectorAll('a[href*="userdetails"]').length > 0) break;
+    try {
+      const L = window.Livewire;
+      if (L && L.find) {
+        const els = document.getElementsByTagName('*');
+        for (const el of els) {
+          const id = el.getAttribute && el.getAttribute('wire:id');
+          if (id) {
+            try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+            const c = L.find(id);
+            if (c) ['loadTable', 'loadRecords'].forEach(m => { try { c.call(m); } catch (e) {} });
+          }
+        }
+      }
+    } catch (e) {}
+    await sleep(1000);
+  }
+  // 设每页条数（按 option 值识别 select，和油猴脚本一致）
+  const findPerPageSelect = () => {
+    for (const s of document.querySelectorAll('select')) {
+      const vals = Array.from(s.options).map(o => parseInt(o.value)).filter(v => !isNaN(v));
+      if (vals.length >= 2 && vals.every(v => v <= 500) && (vals.includes(10) || vals.includes(25) || vals.includes(50))) return s;
+    }
+    return null;
+  };
+  const setPerPage = async (target) => {
+    const sel = findPerPageSelect();
+    if (!sel) return false;
+    const opt = Array.from(sel.options).find(o => parseInt(o.value) === target)
+      || Array.from(sel.options).find(o => parseInt(o.value) >= target)
+      || Array.from(sel.options).reduce((a, b) => (parseInt(a.value) > parseInt(b.value) ? a : b));
+    if (parseInt(sel.value) === parseInt(opt.value)) return true;
+    const before = sig();
+    sel.value = opt.value;
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitStable(before);
+    return parseInt(sel.value) === parseInt(opt.value);
+  };
+  await setPerPage(100).catch(() => {});
+  // 找“下一页”按钮（按 aria-label / 文本，和油猴脚本一致）
+  const findNext = () => {
+    const all = Array.from(document.querySelectorAll('a, button, [role="button"], [dusk]'));
+    for (const el of all) {
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      if (aria === 'next' || aria === '下一页' || aria.includes('next page') || aria.includes('pagination.next')) return el;
+    }
+    for (const el of all) {
+      const t = textOf(el).toLowerCase();
+      if (['下一页', 'next', '>', '›', '»', '→'].includes(t)) return el;
+    }
+    return null;
+  };
+  const isDisabled = (el) => {
+    if (!el) return true;
+    if (el.disabled) return true;
+    if (el.getAttribute('aria-disabled') === 'true') return true;
+    if (/(^|\s)disabled(\s|$)/i.test((el.className || '').toString())) return true;
+    return false;
+  };
+  // 解析当前页组员（userdetails 链接 + 等级列）
+  const parseUsers = () => {
+    const users = [], seen = new Set();
+    const add = (id, name, href, level) => {
+      const k = id || href;
+      if (!k || seen.has(k)) return;
+      seen.add(k);
+      users.push({ id: String(id || ''), name: name || (id ? ('id:' + id) : ''), href: href || (id ? ('https://zmpt.cc/userdetails.php?id=' + id) : ''), level: level || '' });
+    };
+    document.querySelectorAll('a[href*="userdetails"]').forEach(a => {
+      const raw = a.getAttribute('href') || '';
+      let href = raw; try { href = new URL(raw, location.href).href; } catch (e) {}
+      const m = raw.match(/[?&](?:id|userid|uid)=(\d+)/);
+      const id = m ? m[1] : '';
+      const name = textOf(a) || (id ? ('id:' + id) : '');
+      let level = '';
+      const tr = a.closest('tr');
+      if (tr) {
+        const table = tr.closest('table');
+        if (table) {
+          const head = table.querySelector('tr');
+          let col = -1;
+          if (head) Array.from(head.querySelectorAll('th, td')).forEach((h, i) => { if (col < 0 && /等级|用户组|class|level|group/i.test(textOf(h))) col = i; });
+          if (col >= 0) { const cells = tr.querySelectorAll('td'); level = cells[col] ? textOf(cells[col]) : ''; }
+        }
+      }
+      add(id, name, href, level);
+    });
+    return users;
+  };
+  // 翻页收集
+  const all = []; const seenAll = new Set(); let safety = 0;
+  while (safety++ < 100) {
+    const pageUsers = parseUsers();
+    if (pageUsers.length === 0) break;
+    for (const u of pageUsers) { const k = u.id || u.href; if (!seenAll.has(k)) { seenAll.add(k); all.push(u); } }
+    const nextBtn = findNext();
+    if (!nextBtn || isDisabled(nextBtn)) break;
+    const before = sig();
+    nextBtn.click();
+    await waitStable(before);
+  }
+  return all;
+}
+"""
+
     def _fetch_users_browser(self, role_id):
-        """用 MP 内置浏览器渲染组员页(执行Livewire/Filament JS)，返回 (users, diag)。"""
+        """浏览器模式：渲染组员页，跑移植自油猴脚本的“设每页100+翻页”逻辑，返回 (users, diag)。"""
         url = (self._member_url.replace("{id}", str(role_id)).replace("{page}", "1")
                if self._member_url else f"{self._base}/nexusphp/roles/{role_id}/edit?page=1")
-        html = self._render_with_browser(url)
-        if not html:
-            return [], f"内置浏览器渲染失败/超时（请确认MP已安装Playwright浏览器内核）| URL={url}"
-        users = self._parse_users(html, role_id=role_id)
-        diag = "[浏览器模式] " + self._build_diag(url, html, 200, len(html))
-        return users, diag
+        raw = self._render_with_browser(url)
+        if not raw:
+            return [], f"[浏览器模式] 内置浏览器渲染失败/超时 | URL={url}"
+        users = []
+        for u in raw:
+            uid = str(u.get("id") or "").strip()
+            if not uid:
+                continue
+            users.append({
+                "id": uid,
+                "name": (u.get("name") or f"id:{uid}").strip(),
+                "level": (u.get("level") or "").strip(),
+                "href": (u.get("href") or f"{self._base}/userdetails.php?id={uid}").strip(),
+            })
+        if not users:
+            return [], f"[浏览器模式] 表格已加载但未解析到组员链接 | URL={url}"
+        return users, None
 
     def _render_with_browser(self, url):
         """用 MP 内置浏览器渲染组员页：每页调到100条，并自动翻页把所有页的HTML收集起来。失败重试一次。"""
@@ -482,101 +624,12 @@ class ZmptKeeperCheck(_PluginBase):
                     page.evaluate("() => new Promise(r => setTimeout(r, 1500))")
                 except Exception:
                     pass
-            # 3) 表格加载后把每页调到100（三种方式一起上：改select + Livewire set + loadTable 强制刷新）
+            # 3) 运行移植自油猴脚本的抓取逻辑：设每页100 + 点"下一页"翻页，直接返回组员列表
             try:
-                page.evaluate("""() => {
-                    try {
-                        document.querySelectorAll('select').forEach(s => {
-                            const m = (s.getAttribute('wire:model') || '') + ' ' + (s.getAttribute('wire:model.live') || '') + ' ' + (s.name || '');
-                            if (/perPage|PerPage/i.test(m)) {
-                                const opts = [...s.options].map(o => parseInt(o.value)).filter(v => !isNaN(v) && v > 0);
-                                const target = opts.includes(100) ? 100 : (opts.length ? Math.max(...opts) : null);
-                                if (target !== null) {
-                                    s.value = String(target);
-                                    s.dispatchEvent(new Event('change', {bubbles: true}));
-                                    s.dispatchEvent(new Event('input', {bubbles: true}));
-                                }
-                            }
-                        });
-                    } catch(e){}
-                    try {
-                        const L = window.Livewire;
-                        if (L && L.find) {
-                            const els = document.getElementsByTagName('*');
-                            for (const el of els) {
-                                const id = el.getAttribute && el.getAttribute('wire:id');
-                                if (id) { try { L.find(id).set('tableRecordsPerPage', 100); } catch(e){} }
-                            }
-                        }
-                    } catch(e){}
-                }""")
-                # 用新的每页条数强制重新加载
-                try:
-                    page.evaluate("""() => {
-                        try {
-                            const L = window.Livewire;
-                            if (L && L.find) {
-                                const els = document.getElementsByTagName('*');
-                                for (const el of els) {
-                                    const id = el.getAttribute && el.getAttribute('wire:id');
-                                    if (id) { try { L.find(id).call('loadTable'); } catch(e){} }
-                                }
-                            }
-                        } catch(e){}
-                    }""")
-                except Exception:
-                    pass
-                page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-            # 4) 翻页收集：调 nextPage，比对组员ID，有新ID就继续，没有就停
-            get_ids_js = """() => {
-                const ids = []; const seen = new Set();
-                document.querySelectorAll('a[href]').forEach(a => {
-                    const h = a.href || '';
-                    if (/(user|profile|member|userdetails|uid|userid)/i.test(h)) {
-                        const m = h.match(/[0-9]{2,}/);
-                        if (m && !seen.has(m[0])) { seen.add(m[0]); ids.push(m[0]); }
-                    }
-                });
-                return ids;
-            }"""
-            call_next_js = """() => {
-                try {
-                    const L = window.Livewire;
-                    if (L && L.find) {
-                        const els = document.getElementsByTagName('*');
-                        for (const el of els) {
-                            const id = el.getAttribute && el.getAttribute('wire:id');
-                            if (id) { try { L.find(id).call('nextPage'); } catch(e){} }
-                        }
-                    }
-                } catch(e){}
-            }"""
-            parts = []
-            try:
-                parts.append(page.content())
-            except Exception:
-                parts.append("")
-            try:
-                seen = set(page.evaluate(get_ids_js))
-            except Exception:
-                seen = set()
-            for _ in range(20):
-                try:
-                    page.evaluate(call_next_js)
-                    page.wait_for_load_state("networkidle", timeout=15000)
-                except Exception:
-                    break
-                try:
-                    cur = set(page.evaluate(get_ids_js))
-                except Exception:
-                    break
-                if not cur - seen:
-                    break  # 没有新组员 → 最后一页
-                seen |= cur
-                parts.append(page.content())
-            return "\n".join(parts)
+                return page.evaluate(self._FETCH_ALL_JS)
+            except Exception as e:
+                logger.warn(f"ZMPT 浏览器抓取脚本执行失败: {e}")
+                return None
 
         for attempt in range(2):
             try:
