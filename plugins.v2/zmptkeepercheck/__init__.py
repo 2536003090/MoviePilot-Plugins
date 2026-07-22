@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -688,9 +688,9 @@ async () => {
         """浏览器模式：渲染组员页，跑移植自油猴脚本的“设每页100+翻页”逻辑，返回 (users, diag)。"""
         url = (self._member_url.replace("{id}", str(role_id)).replace("{page}", "1")
                if self._member_url else f"{self._base}/nexusphp/roles/{role_id}/edit?page=1")
-        raw = self._render_with_browser(url)
+        raw, err = self._render_with_browser(url)
         if not raw:
-            return [], f"[浏览器模式] 内置浏览器渲染失败/超时 | URL={url}"
+            return [], f"[浏览器模式] 内置浏览器渲染失败：{err} | URL={url}"
         users = []
         for u in raw:
             uid = str(u.get("id") or "").strip()
@@ -707,12 +707,14 @@ async () => {
         return users, None
 
     def _render_with_browser(self, url):
-        """用 MP 内置浏览器渲染组员页：每页调到100条，并自动翻页把所有页的HTML收集起来。失败重试一次。"""
+        """用 MP 内置浏览器渲染组员页。返回 (data, error)：data 为组员列表或 None，error 为失败原因。"""
         try:
             from app.helper.browser import PlaywrightHelper
         except Exception as e:
             logger.warn(f"ZMPT PlaywrightHelper 不可用: {e}")
-            return None
+            return None, f"PlaywrightHelper 导入失败({e})——你的 MP 可能未集成浏览器模块"
+
+        last_err = [""]  # 回调内捕获的错误（用 list 做可变持有）
 
         def _collect(page):
             try:
@@ -778,6 +780,7 @@ async () => {
             try:
                 return page.evaluate(self._FETCH_ALL_JS)
             except Exception as e:
+                last_err[0] = f"抓取脚本执行失败: {e}"
                 logger.warn(f"ZMPT 浏览器抓取脚本执行失败: {e}")
                 return None
 
@@ -786,11 +789,14 @@ async () => {
                 html = PlaywrightHelper().action(url, _collect,
                                                  cookies=self._cookie, headless=True, timeout=240)
                 if html:
-                    return html
+                    return html, ""
             except Exception as e:
+                last_err[0] = f"浏览器渲染异常: {e}"
                 logger.warn(f"ZMPT 浏览器渲染失败(第{attempt+1}次): {e}")
             time.sleep(5)
-        return None
+        err = last_err[0] or ("浏览器启动或页面加载失败——常见原因：MP 未安装/未启用 Playwright 浏览器内核、内存不足、容器沙箱拦截。"
+                              "请到 MP 日志搜索 '网页操作失败' / 'CloakBrowser' / 'playwright' 查看具体报错。")
+        return None, err
 
     @staticmethod
     def _extract_uid(href):
