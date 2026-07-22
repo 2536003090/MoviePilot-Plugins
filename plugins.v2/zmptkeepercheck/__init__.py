@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -482,9 +482,23 @@ class ZmptKeeperCheck(_PluginBase):
                     page.evaluate("() => new Promise(r => setTimeout(r, 1500))")
                 except Exception:
                     pass
-            # 3) 表格加载后再设每页 100（避免干扰加载触发）
+            # 3) 表格加载后把每页调到100（三种方式一起上：改select + Livewire set + loadTable 强制刷新）
             try:
                 page.evaluate("""() => {
+                    try {
+                        document.querySelectorAll('select').forEach(s => {
+                            const m = (s.getAttribute('wire:model') || '') + ' ' + (s.getAttribute('wire:model.live') || '') + ' ' + (s.name || '');
+                            if (/perPage|PerPage/i.test(m)) {
+                                const opts = [...s.options].map(o => parseInt(o.value)).filter(v => !isNaN(v) && v > 0);
+                                const target = opts.includes(100) ? 100 : (opts.length ? Math.max(...opts) : null);
+                                if (target !== null) {
+                                    s.value = String(target);
+                                    s.dispatchEvent(new Event('change', {bubbles: true}));
+                                    s.dispatchEvent(new Event('input', {bubbles: true}));
+                                }
+                            }
+                        });
+                    } catch(e){}
                     try {
                         const L = window.Livewire;
                         if (L && L.find) {
@@ -496,32 +510,7 @@ class ZmptKeeperCheck(_PluginBase):
                         }
                     } catch(e){}
                 }""")
-                page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-            # 4) 翻页收集：读取当前页，若有可用“下一页”则翻页继续，最多20页
-            parts = []
-            try:
-                parts.append(page.content())
-            except Exception:
-                parts.append("")
-            for _ in range(20):
-                try:
-                    has_next = page.evaluate("""() => {
-                        try {
-                            const btns = Array.from(document.querySelectorAll('button, a'));
-                            const next = btns.find(b => (b.getAttribute('wire:click') || '').includes('nextPage'));
-                            if (!next) return false;
-                            if (next.disabled) return false;
-                            if (next.getAttribute('aria-disabled') === 'true') return false;
-                            if (Array.from(next.classList).some(c => /disabled|not-allowed/.test(c))) return false;
-                            return true;
-                        } catch(e){ return false; }
-                    }""")
-                except Exception:
-                    has_next = False
-                if not has_next:
-                    break
+                # 用新的每页条数强制重新加载
                 try:
                     page.evaluate("""() => {
                         try {
@@ -530,20 +519,63 @@ class ZmptKeeperCheck(_PluginBase):
                                 const els = document.getElementsByTagName('*');
                                 for (const el of els) {
                                     const id = el.getAttribute && el.getAttribute('wire:id');
-                                    if (id) { try { L.find(id).call('nextPage'); } catch(e){} }
+                                    if (id) { try { L.find(id).call('loadTable'); } catch(e){} }
                                 }
                             }
                         } catch(e){}
                     }""")
-                    page.wait_for_load_state("networkidle", timeout=20000)
-                    try:
-                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                        page.wait_for_load_state("networkidle", timeout=15000)
-                    except Exception:
-                        pass
-                    parts.append(page.content())
+                except Exception:
+                    pass
+                page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+            # 4) 翻页收集：调 nextPage，比对组员ID，有新ID就继续，没有就停
+            get_ids_js = """() => {
+                const ids = []; const seen = new Set();
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const h = a.href || '';
+                    if (/(user|profile|member|userdetails|uid|userid)/i.test(h)) {
+                        const m = h.match(/[0-9]{2,}/);
+                        if (m && !seen.has(m[0])) { seen.add(m[0]); ids.push(m[0]); }
+                    }
+                });
+                return ids;
+            }"""
+            call_next_js = """() => {
+                try {
+                    const L = window.Livewire;
+                    if (L && L.find) {
+                        const els = document.getElementsByTagName('*');
+                        for (const el of els) {
+                            const id = el.getAttribute && el.getAttribute('wire:id');
+                            if (id) { try { L.find(id).call('nextPage'); } catch(e){} }
+                        }
+                    }
+                } catch(e){}
+            }"""
+            parts = []
+            try:
+                parts.append(page.content())
+            except Exception:
+                parts.append("")
+            try:
+                seen = set(page.evaluate(get_ids_js))
+            except Exception:
+                seen = set()
+            for _ in range(20):
+                try:
+                    page.evaluate(call_next_js)
+                    page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     break
+                try:
+                    cur = set(page.evaluate(get_ids_js))
+                except Exception:
+                    break
+                if not cur - seen:
+                    break  # 没有新组员 → 最后一页
+                seen |= cur
+                parts.append(page.content())
             return "\n".join(parts)
 
         for attempt in range(2):
