@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -53,6 +53,7 @@ class ZmptKeeperCheck(_PluginBase):
     _use_browser = False  # 用 MP 内置浏览器(Playwright)渲染页面，抓 JS 动态加载的组员
     _scheduler = None  # “立即运行一次”用的一次性调度器
     _stats = {}  # 不合格次数累计 {uid: {name, group, count}}，每月1号7点重置
+    _browser_install_attempted = False  # 本次会话是否已尝试过自动安装浏览器内核
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -706,8 +707,46 @@ async () => {
             return [], f"[浏览器模式] 表格已加载但未解析到组员链接 | URL={url}"
         return users, None
 
+    def _ensure_browser(self):
+        """首次使用浏览器模式时自动准备 Chromium 内核（快速探测；缺失则自动安装，只做一次）。"""
+        if self.get_data("browser_prepared") or self._browser_install_attempted:
+            return
+        self._browser_install_attempted = True
+        # 1) 先快速探测 MP 浏览器能不能用（开个 about:blank）
+        try:
+            from app.helper.browser import PlaywrightHelper
+            if PlaywrightHelper().get_page_source("about:blank", headless=True, timeout=30):
+                self.save_data("browser_prepared", True)
+                logger.info("ZMPT：浏览器内核可用，无需安装。")
+                return
+        except Exception as e:
+            logger.warn(f"ZMPT：浏览器内核探测失败，将尝试自动安装: {e}")
+        # 2) 探测失败 → 自动安装 Chromium 内核（仅内核，不动系统库）
+        logger.info("ZMPT：开始自动安装 Chromium 内核（约150MB，只需一次）")
+        self._notify_msg("ZMPT 浏览器内核",
+                         "首次使用：检测到浏览器内核缺失，正在自动安装 Chromium（约150MB，只需一次），请耐心等待几分钟…")
+        try:
+            import subprocess
+            import sys
+            r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                               capture_output=True, text=True, timeout=600)
+            tail = (((r.stdout or "") + "\n" + (r.stderr or ""))[-400:]).strip()
+            if r.returncode == 0:
+                self.save_data("browser_prepared", True)
+                logger.info("ZMPT：Chromium 内核安装完成")
+                self._notify_msg("ZMPT 浏览器内核", "✅ Chromium 内核已安装，开始抓取。")
+            else:
+                logger.warn(f"ZMPT Chromium 安装失败 rc={r.returncode}: {tail}")
+                self._notify_msg("ZMPT 浏览器内核",
+                                 f"⚠️ 自动安装失败：{tail[:200]}\n建议改用官方 MoviePilot 镜像（自带浏览器内核）。")
+        except Exception as e:
+            logger.warn(f"ZMPT 自动安装浏览器内核异常: {e}")
+            self._notify_msg("ZMPT 浏览器内核",
+                             f"⚠️ 无法自动安装浏览器内核：{e}\n建议改用官方 MoviePilot 镜像（自带浏览器内核）。")
+
     def _render_with_browser(self, url):
         """用 MP 内置浏览器渲染组员页。返回 (data, error)：data 为组员列表或 None，error 为失败原因。"""
+        self._ensure_browser()
         try:
             from app.helper.browser import PlaywrightHelper
         except Exception as e:
