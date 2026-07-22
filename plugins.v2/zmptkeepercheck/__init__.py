@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -328,7 +328,13 @@ class ZmptKeeperCheck(_PluginBase):
                 logger.error(f"ZMPT保种组检查 组{g.get('id')} 出错: {e}")
                 logger.error(traceback.format_exc())
                 summary.append(f"{g.get('name', '组' + str(g.get('id')))}：执行出错 {e}")
-            time.sleep(5)  # 组之间间隔，避免连续开浏览器/密集请求导致后一组失败
+            # 组之间多等一会 + 强制回收，避免前一组浏览器进程未释放导致后一组起不来
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+            time.sleep(15)
         self._save_stats(self._stats)
         self._last_result = "\n\n".join(summary) if summary else "无组配置"
         logger.info("ZMPT保种组检查：执行完成")
@@ -823,7 +829,7 @@ async () => {
                 logger.warn(f"ZMPT 浏览器抓取脚本执行失败: {e}")
                 return None
 
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 html = PlaywrightHelper().action(url, _collect,
                                                  cookies=self._cookie, headless=True, timeout=240)
@@ -832,7 +838,12 @@ async () => {
             except Exception as e:
                 last_err[0] = f"浏览器渲染异常: {e}"
                 logger.warn(f"ZMPT 浏览器渲染失败(第{attempt+1}次): {e}")
-            time.sleep(5)
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+            time.sleep(10)
         err = last_err[0] or ("浏览器启动或页面加载失败——常见原因：MP 未安装/未启用 Playwright 浏览器内核、内存不足、容器沙箱拦截。"
                               "请到 MP 日志搜索 '网页操作失败' / 'CloakBrowser' / 'playwright' 查看具体报错。")
         return None, err
