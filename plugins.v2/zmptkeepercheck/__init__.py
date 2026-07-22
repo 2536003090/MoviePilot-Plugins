@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -273,18 +273,22 @@ class ZmptKeeperCheck(_PluginBase):
                    "if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t); } "
                    "else { var ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta); "
                    "ta.select(); document.execCommand('copy'); document.body.removeChild(ta); } } catch(err){} }")
-        rows = "".join(
-            f"<tr><td style='padding:3px 8px'>{uid}</td>"
-            f"<td style='padding:3px 8px'>{name}</td>"
-            f"<td style='padding:3px 8px;text-align:right'>{cnt}</td></tr>"
-            for uid, name, cnt in members
-        )
+        rows = ""
+        for idx, (uid, name, cnt) in enumerate(members):
+            bg = "background:#f7f9fc;" if idx % 2 else "background:#ffffff;"
+            rows += (
+                f"<tr style='{bg}'>"
+                f"<td style='border:1px solid #d0d7de;padding:5px 10px'>{uid}</td>"
+                f"<td style='border:1px solid #d0d7de;padding:5px 10px'>{name}</td>"
+                f"<td style='border:1px solid #d0d7de;padding:5px 10px;text-align:center;font-weight:600'>{cnt}</td>"
+                f"</tr>"
+            )
         table_html = (
             "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-top:6px'>"
-            "<thead><tr>"
-            "<th style='text-align:left;border-bottom:1px solid #888;padding:3px 8px'>ID</th>"
-            "<th style='text-align:left;border-bottom:1px solid #888;padding:3px 8px'>用户名</th>"
-            "<th style='text-align:right;border-bottom:1px solid #888;padding:3px 8px'>不合格次数</th>"
+            "<thead><tr style='background:#eef1f5'>"
+            "<th style='border:1px solid #d0d7de;padding:6px 10px;text-align:left'>ID</th>"
+            "<th style='border:1px solid #d0d7de;padding:6px 10px;text-align:left'>用户名</th>"
+            "<th style='border:1px solid #d0d7de;padding:6px 10px;text-align:center'>不合格次数</th>"
             "</tr></thead><tbody>" + rows + "</tbody></table>"
         )
         return {"component": "VRow", "content": [
