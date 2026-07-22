@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -415,7 +415,7 @@ async () => {
     return s;
   };
   const waitStable = async (prev, timeout) => {
-    timeout = timeout || 12000;
+    timeout = timeout || 8000;
     const t0 = Date.now();
     while (Date.now() - t0 < timeout) { await sleep(150); if (sig() !== prev) break; }
     let last = sig(), since = Date.now();
@@ -518,18 +518,22 @@ async () => {
     });
     return users;
   };
-  // 翻页收集
+  // 翻页收集（这一页没有新组员就停，避免无效翻页导致超时）
   const all = []; const seenAll = new Set(); let safety = 0;
-  while (safety++ < 100) {
-    const pageUsers = parseUsers();
-    if (pageUsers.length === 0) break;
-    for (const u of pageUsers) { const k = u.id || u.href; if (!seenAll.has(k)) { seenAll.add(k); all.push(u); } }
-    const nextBtn = findNext();
-    if (!nextBtn || isDisabled(nextBtn)) break;
-    const before = sig();
-    nextBtn.click();
-    await waitStable(before);
-  }
+  try {
+    while (safety++ < 30) {
+      const pageUsers = parseUsers();
+      if (pageUsers.length === 0) break;
+      let added = 0;
+      for (const u of pageUsers) { const k = u.id || u.href; if (!seenAll.has(k)) { seenAll.add(k); all.push(u); added++; } }
+      if (added === 0) break;  // 没有新组员 → 到最后一页了（或翻页没生效），停
+      const nextBtn = findNext();
+      if (!nextBtn || isDisabled(nextBtn)) break;
+      const before = sig();
+      nextBtn.click();
+      await waitStable(before);
+    }
+  } catch (e) {}
   return all;
 }
 """
