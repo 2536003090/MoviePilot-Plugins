@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.8"
+    plugin_version = "1.2.0"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -52,6 +52,7 @@ class ZmptKeeperCheck(_PluginBase):
     _member_url = ""  # 组员列表URL模板，支持 {id} 和 {page} 占位符；空则用内置默认
     _use_browser = False  # 用 MP 内置浏览器(Playwright)渲染页面，抓 JS 动态加载的组员
     _scheduler = None  # “立即运行一次”用的一次性调度器
+    _stats = {}  # 不合格次数累计 {uid: {name, group, count}}，每月1号7点重置
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -121,21 +122,35 @@ class ZmptKeeperCheck(_PluginBase):
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """定时任务：用 CronTrigger.from_crontab 解析 cron5 表达式"""
-        if not self.get_state() or not self._cron:
+        """定时任务：① 按用户 cron 检查；② 每月1号7点发送不合格统计并重置"""
+        if not self.get_state():
             return []
+        services = []
+        if self._cron:
+            try:
+                trigger = CronTrigger.from_crontab(self._cron)
+            except Exception as e:
+                logger.error(f"ZMPT cron 表达式非法: {self._cron} -> {e}")
+            else:
+                services.append({
+                    "id": "ZmptKeeperCheck.Check",
+                    "name": "ZMPT保种组检查",
+                    "trigger": trigger,
+                    "func": self.check,
+                    "kwargs": {},
+                })
+        # 每月1号 07:00 发送累计不合格统计并重置
         try:
-            trigger = CronTrigger.from_crontab(self._cron)
+            services.append({
+                "id": "ZmptKeeperCheck.Monthly",
+                "name": "ZMPT月度统计与重置",
+                "trigger": CronTrigger.from_crontab("0 7 1 * *"),
+                "func": self.monthly_report,
+                "kwargs": {},
+            })
         except Exception as e:
-            logger.error(f"ZMPT cron 表达式非法: {self._cron} -> {e}")
-            return []
-        return [{
-            "id": "ZmptKeeperCheck.Check",
-            "name": "ZMPT保种组检查",
-            "trigger": trigger,
-            "func": self.check,
-            "kwargs": {},
-        }]
+            logger.error(f"ZMPT 月度 cron 非法: {e}")
+        return services
 
     @eventmanager.register(EventType.PluginAction)
     def _on_action(self, event: Event):
@@ -199,7 +214,7 @@ class ZmptKeeperCheck(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12}, "content": [
                         {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                            "text": "打开\"立即运行一次\"开关并保存，3秒后执行一次检查（执行完会自动关闭）。组配置已内置（5T组id=6 / 10T组id=10），无需填写。"}},
+                            "text": "打开\"立即运行一次\"开关并保存，3秒后执行一次检查（执行完会自动关闭）。组配置已内置（5T组id=6 / 10T组id=10），无需填写。每次检查会累计不合格次数，每月1号7点推送统计并重置，插件详情页可查看。"}},
                     ]},
                 ]},
             ]},
@@ -215,18 +230,39 @@ class ZmptKeeperCheck(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        if not self._last_result:
-            return [
-                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                    "text": "尚未运行。配置好 Cookie 后，发送 /zmpt_check 立即执行，或等待定时触发。"}},
-            ]
-        return [
-            {"component": "VRow", "content": [
+        stats = self._load_stats()
+        stats_text = self._format_stats(stats) if stats else ""
+        result = []
+        # 顶部：不合格次数累计统计（用户要的主展示）
+        if stats:
+            total_people = len(stats)
+            total_times = sum(int(v.get("count", 0) or 0) for v in stats.values())
+            result.append({"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
-                    {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text": self._last_result}},
+                    {"component": "VAlert", "props": {"type": "warning", "variant": "tonal",
+                        "text": f"📊 不合格累计统计 · 共 {total_people} 人 / {total_times} 次（每月1号 07:00 推送并重置）"}},
                 ]},
+            ]})
+            result.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": stats_text}},
+                ]},
+            ]})
+        else:
+            result.append({"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                        "text": "暂无不合格统计。每次检查会把不合格组员计入；每月1号 07:00 自动推送并重置。"}},
+                ]},
+            ]})
+        # 底部：最近一次检查结果
+        result.append({"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12}, "content": [
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                    "text": self._last_result or "尚未运行。配置好 Cookie 后，发送 /zmpt_check 立即执行，或等待定时触发。"}},
             ]},
-        ]
+        ]})
+        return result
 
     # ====================== 核心流程 ======================
     def check(self):
@@ -238,6 +274,7 @@ class ZmptKeeperCheck(_PluginBase):
             self._notify_msg("ZMPT保种组检查", "⚠️ 未配置 Cookie，无法抓取。请在插件设置填入 zmpt.cc 的 Cookie。")
             return
         logger.info("ZMPT保种组检查：开始执行")
+        self._stats = self._load_stats()
         summary = []
         for g in self._groups:
             try:
@@ -247,6 +284,7 @@ class ZmptKeeperCheck(_PluginBase):
                 logger.error(traceback.format_exc())
                 summary.append(f"{g.get('name', '组' + str(g.get('id')))}：执行出错 {e}")
             time.sleep(5)  # 组之间间隔，避免连续开浏览器/密集请求导致后一组失败
+        self._save_stats(self._stats)
         self._last_result = "\n\n".join(summary) if summary else "无组配置"
         logger.info("ZMPT保种组检查：执行完成")
 
@@ -272,6 +310,7 @@ class ZmptKeeperCheck(_PluginBase):
                 else:
                     bad_n += 1
                     status = "不合格"
+                    self._bump_stat(g["name"], u)
             rows.append({"id": u["id"], "name": u["name"], "level": u["level"],
                          "vol": volstr, "intt": intt, "status": status})
             time.sleep(self._delay)
@@ -297,6 +336,69 @@ class ZmptKeeperCheck(_PluginBase):
         else:
             lines.append("✅ 全部合格，无不合格组员。")
         return "\n".join(lines)
+
+    # ====================== 不合格次数统计（持久化，每月1号7点重置）======================
+    def _load_stats(self):
+        try:
+            d = self.get_data("unqual_stats")
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_stats(self, stats):
+        try:
+            self.save_data("unqual_stats", stats or {})
+        except Exception as e:
+            logger.warn(f"ZMPT 保存不合格统计失败: {e}")
+
+    def _bump_stat(self, group_name, u):
+        """某组员本次判定为不合格，累计 +1。"""
+        uid = str(u.get("id") or "").strip()
+        if not uid:
+            return
+        s = self._stats.get(uid) or {"name": "", "group": group_name, "count": 0}
+        s["name"] = (u.get("name") or "").strip() or s.get("name") or f"id:{uid}"
+        s["group"] = group_name
+        s["count"] = int(s.get("count", 0) or 0) + 1
+        self._stats[uid] = s
+
+    def _format_stats(self, stats=None):
+        """把累计统计格式化成文本，按组分类，按次数降序。"""
+        stats = self._load_stats() if stats is None else (stats or {})
+        by_group = {}
+        for uid, info in stats.items():
+            g = (info.get("group") or "未知组").strip()
+            by_group.setdefault(g, []).append((str(uid), (info.get("name") or "").strip(), int(info.get("count", 0) or 0)))
+        lines = []
+        for g in ["5T组", "10T组"]:
+            members = sorted(by_group.pop(g, []), key=lambda x: (-x[2], x[0]))
+            if not members:
+                continue
+            lines.append(f"【{g} 不合格统计】共 {len(members)} 人（自上次重置累计）")
+            lines.append("ID\t用户名\t不合格次数")
+            for uid, name, cnt in members:
+                lines.append(f"{uid}\t{name}\t{cnt}")
+            lines.append("")
+        # 其余未识别的组
+        for g, members in by_group.items():
+            members.sort(key=lambda x: (-x[2], x[0]))
+            lines.append(f"【{g} 不合格统计】共 {len(members)} 人")
+            lines.append("ID\t用户名\t不合格次数")
+            for uid, name, cnt in members:
+                lines.append(f"{uid}\t{name}\t{cnt}")
+            lines.append("")
+        return "\n".join(lines).strip() if lines else "（暂无不合格记录）"
+
+    def monthly_report(self):
+        """每月1号7点：发送累计不合格统计，然后重置。"""
+        logger.info("ZMPT保种组检查：执行月度统计与重置")
+        stats = self._load_stats()
+        text = self._format_stats(stats)
+        total = sum(int(v.get("count", 0) or 0) for v in stats.values())
+        title = f"ZMPT 月度不合格统计（{datetime.now().strftime('%Y-%m')}，{len(stats)}人/{total}次，即将重置）"
+        self._notify_msg(title, text if stats else "本月无不合格记录。")
+        self._save_stats({})
+        self._stats = {}
 
     # ====================== HTTP ======================
     def _cookie_dict(self):
