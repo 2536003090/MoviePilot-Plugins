@@ -26,7 +26,7 @@ class ZmptKeeperCheck(_PluginBase):
     plugin_name = "ZMPT保种组检查"
     plugin_desc = "定时抓取ZMPT保种组官种体积，判定合格/不合格；结果推送到通知渠道。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "2536003090"
     author_url = "https://github.com/2536003090"
     plugin_config_prefix = "zmptkeeper_"
@@ -231,38 +231,78 @@ class ZmptKeeperCheck(_PluginBase):
 
     def get_page(self) -> List[dict]:
         stats = self._load_stats()
-        stats_text = self._format_stats(stats) if stats else ""
         result = []
-        # 顶部：不合格次数累计统计（用户要的主展示）
-        if stats:
-            total_people = len(stats)
-            total_times = sum(int(v.get("count", 0) or 0) for v in stats.values())
-            result.append({"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12}, "content": [
-                    {"component": "VAlert", "props": {"type": "warning", "variant": "tonal",
-                        "text": f"📊 不合格累计统计 · 共 {total_people} 人 / {total_times} 次（每月1号 07:00 推送并重置）"}},
-                ]},
-            ]})
-            result.append({"component": "VRow", "content": [
-                {"component": "VCol", "props": {"cols": 12}, "content": [
-                    {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "text": stats_text}},
-                ]},
-            ]})
-        else:
+        # 顶部说明
+        result.append({"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12}, "content": [
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                    "text": "📊 不合格累计统计（每月1号 07:00 推送并重置）。点「复制」可粘到电子表格。"}},
+            ]},
+        ]})
+        if not stats:
             result.append({"component": "VRow", "content": [
                 {"component": "VCol", "props": {"cols": 12}, "content": [
                     {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                        "text": "暂无不合格统计。每次检查会把不合格组员计入；每月1号 07:00 自动推送并重置。"}},
+                        "text": "暂无统计。运行一次检查后会开始累计不合格次数。"}},
                 ]},
             ]})
+        else:
+            by_group = {}
+            for uid, info in stats.items():
+                g = (info.get("group") or "未知组").strip()
+                by_group.setdefault(g, []).append((str(uid), (info.get("name") or "").strip(), int(info.get("count", 0) or 0)))
+            for g in ["5T组", "10T组"] + [k for k in by_group if k not in ("5T组", "10T组")]:
+                members = sorted(by_group.pop(g, []), key=lambda x: (-x[2], x[0]))
+                if not members:
+                    continue
+                result.append(self._stats_group_card(g, members))
         # 底部：最近一次检查结果
         result.append({"component": "VRow", "content": [
             {"component": "VCol", "props": {"cols": 12}, "content": [
                 {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-                    "text": self._last_result or "尚未运行。配置好 Cookie 后，发送 /zmpt_check 立即执行，或等待定时触发。"}},
+                    "text": self._last_result or "尚未运行。"}},
             ]},
         ]})
         return result
+
+    def _stats_group_card(self, group_name, members):
+        """构造一个组的不合格统计卡片：组名 + 复制按钮 + HTML 表格（ID/用户名/不合格次数）。"""
+        tsv = "ID\t用户名\t不合格次数\n" + "\n".join(f"{uid}\t{name}\t{cnt}" for uid, name, cnt in members)
+        tsv_js = json.dumps(tsv)
+        onclick = ("(e) => { try { var t = " + tsv_js + "; "
+                   "if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t); } "
+                   "else { var ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta); "
+                   "ta.select(); document.execCommand('copy'); document.body.removeChild(ta); } } catch(err){} }")
+        rows = "".join(
+            f"<tr><td style='padding:3px 8px'>{uid}</td>"
+            f"<td style='padding:3px 8px'>{name}</td>"
+            f"<td style='padding:3px 8px;text-align:right'>{cnt}</td></tr>"
+            for uid, name, cnt in members
+        )
+        table_html = (
+            "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-top:6px'>"
+            "<thead><tr>"
+            "<th style='text-align:left;border-bottom:1px solid #888;padding:3px 8px'>ID</th>"
+            "<th style='text-align:left;border-bottom:1px solid #888;padding:3px 8px'>用户名</th>"
+            "<th style='text-align:right;border-bottom:1px solid #888;padding:3px 8px'>不合格次数</th>"
+            "</tr></thead><tbody>" + rows + "</tbody></table>"
+        )
+        return {"component": "VRow", "content": [
+            {"component": "VCol", "props": {"cols": 12}, "content": [
+                {"component": "VCard", "props": {"variant": "outlined", "class": "mb-3"}, "content": [
+                    {"component": "VRow", "props": {"align": "center"}, "content": [
+                        {"component": "VCol", "content": [
+                            {"component": "div", "html": f"<div style='font-weight:700;font-size:15px;padding:4px 8px'>{group_name} · 不合格 {len(members)} 人</div>"},
+                        ]},
+                        {"component": "VCol", "props": {"cols": "auto"}, "content": [
+                            {"component": "VBtn", "props": {"size": "small", "color": "primary", "variant": "outlined",
+                                "onclick": onclick}, "text": "📋 复制本组"},
+                        ]},
+                    ]},
+                    {"component": "div", "html": table_html},
+                ]},
+            ]},
+        ]}
 
     # ====================== 核心流程 ======================
     def check(self):
@@ -291,7 +331,7 @@ class ZmptKeeperCheck(_PluginBase):
     def _check_group(self, g):
         users, diag = self._fetch_users(g["id"])
         if not users:
-            msg = f"[插件v{self.plugin_version}{'/浏览器' if self._use_browser else '/普通'}] ⚠️ {g['name']}：未抓到组员（组id={g['id']}）。\n诊断：{diag}"
+            msg = f"⚠️ {g['name']}：未抓到组员（组id={g['id']}）。\n诊断：{diag}"
             self._notify_msg(f"ZMPT {g['name']}", msg)
             return msg
         rows = []
@@ -316,14 +356,13 @@ class ZmptKeeperCheck(_PluginBase):
             time.sleep(self._delay)
         text = self._format_text(g, rows, ok_n, bad_n, err_n)
         self._notify_msg(f"ZMPT {g['name']} 审查结果", text)
-        summary = f"[v{self.plugin_version}{'/浏览器' if self._use_browser else '/普通'}] 【{g['name']}】共 {len(rows)} 人 · 合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}"
+        summary = f"【{g['name']}】共 {len(rows)} 人 · 合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}"
         return summary
 
     def _format_text(self, g, rows, ok_n, bad_n, err_n):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         bad_rows = [r for r in rows if r["status"] == "不合格"]
         lines = [
-            f"插件版本：v{self.plugin_version}（{'浏览器模式' if self._use_browser else '普通模式'}）",
             f"抓取时间：{now}",
             f"{g['name']} · 阈值 ≥ {g['threshold']:.0f} TB · 共 {len(rows)} 人（合格 {ok_n} / 不合格 {bad_n} / 异常 {err_n}）",
         ]
